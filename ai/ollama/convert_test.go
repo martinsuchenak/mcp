@@ -2,8 +2,6 @@ package ollama
 
 import (
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -22,7 +20,7 @@ func TestConvertMessagesFull(t *testing.T) {
 		},
 		{Role: "tool", Content: "result", ToolCallID: "call_1"},
 	}
-	out := c.convertMessages(msgs)
+	out := mustConvert(t, c, msgs)
 	if len(out) != 3 {
 		t.Fatalf("len = %d, want 3", len(out))
 	}
@@ -56,7 +54,7 @@ func TestSplitContentVariants(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			text, images := splitContent(tt.msg)
+			text, images := mustSplit(t, tt.msg)
 			if text != tt.wantText {
 				t.Errorf("text = %q, want %q", text, tt.wantText)
 			}
@@ -71,34 +69,9 @@ func TestSplitContentDataURIImage(t *testing.T) {
 	msg := openai.Message{Content: []openai.ContentPart{
 		{Type: "image_url", ImageURL: &openai.ImageURL{URL: "data:image/png;base64,QUJD"}},
 	}}
-	_, images := splitContent(msg)
+	_, images := mustSplit(t, msg)
 	if len(images) != 1 || images[0] != "QUJD" {
 		t.Errorf("images = %v, want [QUJD]", images)
-	}
-}
-
-func TestSplitContentRemoteImageFetched(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("PNGDATA"))
-	}))
-	defer srv.Close()
-
-	msg := openai.Message{Content: []openai.ContentPart{
-		{Type: "image_url", ImageURL: &openai.ImageURL{URL: srv.URL}},
-	}}
-	_, images := splitContent(msg)
-	if len(images) != 1 {
-		t.Fatalf("images = %v, want 1 fetched image", images)
-	}
-}
-
-func TestSplitContentRemoteImageFetchFails(t *testing.T) {
-	msg := openai.Message{Content: []openai.ContentPart{
-		{Type: "image_url", ImageURL: &openai.ImageURL{URL: "http://127.0.0.1:1/unreachable"}},
-	}}
-	_, images := splitContent(msg)
-	if len(images) != 0 {
-		t.Errorf("images = %v, want none when fetch fails", images)
 	}
 }
 
@@ -120,40 +93,6 @@ func TestDataURIToBase64(t *testing.T) {
 				t.Errorf("dataURIToBase64(%q) = (%q,%v), want (%q,%v)", tt.in, got, ok, tt.wantB64, tt.wantOK)
 			}
 		})
-	}
-}
-
-func TestFetchImageBase64Success(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("hello"))
-	}))
-	defer srv.Close()
-
-	got, err := fetchImageBase64(srv.URL)
-	if err != nil {
-		t.Fatalf("fetchImageBase64() error: %v", err)
-	}
-	if got != "aGVsbG8=" {
-		t.Errorf("got = %q, want base64 of 'hello'", got)
-	}
-}
-
-func TestFetchImageBase64NonOK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
-
-	_, err := fetchImageBase64(srv.URL)
-	if err == nil {
-		t.Fatal("expected error for 404 response")
-	}
-}
-
-func TestFetchImageBase64RequestError(t *testing.T) {
-	_, err := fetchImageBase64("http://127.0.0.1:1/unreachable")
-	if err == nil {
-		t.Fatal("expected error for unreachable host")
 	}
 }
 
@@ -194,7 +133,7 @@ func TestBuildChatRequestExtraBodyOptions(t *testing.T) {
 			"options": map[string]any{"num_ctx": 4096, "seed": 42},
 		},
 	}
-	got := c.buildChatRequest(req, false)
+	got := mustBuild(t, c, req, false)
 	if got.Options["num_ctx"] != 4096 || got.Options["seed"] != 42 {
 		t.Errorf("options = %+v, want num_ctx/seed merged in", got.Options)
 	}
@@ -207,7 +146,7 @@ func TestBuildChatRequestExtraBodyIgnoredWhenNotOptionsMap(t *testing.T) {
 		Messages:  []openai.Message{{Role: "user", Content: "hi"}},
 		ExtraBody: map[string]any{"options": "not a map"},
 	}
-	got := c.buildChatRequest(req, false)
+	got := mustBuild(t, c, req, false)
 	if len(got.Options) != 0 {
 		t.Errorf("options = %+v, want empty when ExtraBody.options isn't a map", got.Options)
 	}
@@ -303,7 +242,7 @@ func TestStreamChunkToOpenAIDoneNoUsageWhenBothZero(t *testing.T) {
 // up from the assistant's tool calls by call id.
 func TestConvertMessagesToolResultsCarryToolName(t *testing.T) {
 	c := &Client{}
-	msgs := c.convertMessages([]openai.Message{
+	msgs := mustConvert(t, c, []openai.Message{
 		{Role: "user", Content: "weather in Paris and Tokyo?"},
 		{Role: "assistant", ToolCalls: []openai.ToolCall{
 			{ID: "call_a", Type: "function", Function: openai.ToolCallFunction{Name: "weather", Arguments: map[string]any{"city": "Paris"}}},
@@ -345,7 +284,7 @@ func mustJSON(t *testing.T, v any) []byte {
 func TestBuildChatRequestThink(t *testing.T) {
 	c := &Client{}
 	body := func(req openai.ChatCompletionRequest) string {
-		b, err := json.Marshal(c.buildChatRequest(req, false))
+		b, err := json.Marshal(mustBuild(t, c, req, false))
 		if err != nil {
 			t.Fatal(err)
 		}

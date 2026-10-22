@@ -98,7 +98,7 @@ func TestBuildChatRequestMapsOptions(t *testing.T) {
 		Tools: []openai.Tool{{Type: "function", Function: openai.ToolFunction{Name: "t", Parameters: map[string]any{"type": "object"}}}},
 	}
 	c := &Client{}
-	got := c.buildChatRequest(req, true)
+	got := mustBuild(t, c, req, true)
 	if !got.Stream || got.Model != "llama3" {
 		t.Fatalf("stream/model wrong: %+v", got)
 	}
@@ -118,7 +118,7 @@ func TestSplitContentImages(t *testing.T) {
 		{Type: "text", Text: "look"},
 		{Type: "image_url", ImageURL: &openai.ImageURL{URL: "data:image/png;base64,iVBORw0K"}},
 	}}
-	text, images := splitContent(msg)
+	text, images := mustSplit(t, msg)
 	if text != "look" {
 		t.Fatalf("text = %q", text)
 	}
@@ -163,7 +163,7 @@ func TestEmbeddingInputs(t *testing.T) {
 func TestChatRequestJSONShape(t *testing.T) {
 	temp := 0.5
 	c := &Client{}
-	cr := c.buildChatRequest(openai.ChatCompletionRequest{
+	cr := mustBuild(t, c, openai.ChatCompletionRequest{
 		Model:       "m",
 		Messages:    []openai.Message{{Role: "user", Content: "x"}},
 		Temperature: &temp,

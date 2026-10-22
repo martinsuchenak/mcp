@@ -1,23 +1,29 @@
 package ollama
 
 import (
-	"encoding/base64"
-	"fmt"
-	"io"
-	"net/http"
+	"errors"
 	"strings"
 
 	"github.com/paularlott/mcp/ai/openai"
 )
 
+// ErrImageURLNotSupported is returned for an image_url content part that is
+// not a data: URI. Ollama only accepts inline base64 images, and the client
+// does not fetch URLs on the caller's behalf: fetch the image yourself and
+// pass it as a data: URI.
+var ErrImageURLNotSupported = errors.New("ollama: image_url must be a data: URI; Ollama does not accept image URLs")
+
 // convertMessages turns OpenAI messages into Ollama messages, pulling images
 // out of multimodal content parts into Ollama's top-level images field.
-func (c *Client) convertMessages(messages []openai.Message) []message {
+func (c *Client) convertMessages(messages []openai.Message) ([]message, error) {
 	out := make([]message, 0, len(messages))
 	toolNames := map[string]string{} // tool call id -> tool name
 	for _, m := range messages {
 		om := message{Role: m.Role}
-		text, images := splitContent(m)
+		text, images, err := splitContent(m)
+		if err != nil {
+			return nil, err
+		}
 		om.Content = text
 		om.Images = images
 		if len(m.ToolCalls) > 0 {
@@ -37,22 +43,23 @@ func (c *Client) convertMessages(messages []openai.Message) []message {
 		}
 		out = append(out, om)
 	}
-	return out
+	return out, nil
 }
 
 // splitContent extracts plain text and base64 images from an OpenAI message's
-// content (string or content-parts array). Remote http(s) image URLs are
-// fetched once and re-encoded as base64, since Ollama only accepts inline data.
-func splitContent(m openai.Message) (string, []string) {
+// content (string or content-parts array). Images must be data: URIs: Ollama
+// only accepts inline data, and fetching a URL here would make the caller's
+// host fetch whatever a message names, outside any HTTP policy it applies.
+func splitContent(m openai.Message) (string, []string, error) {
 	if m.Content == nil {
-		return "", nil
+		return "", nil, nil
 	}
 	if s, ok := m.Content.(string); ok {
-		return s, nil
+		return s, nil, nil
 	}
 	parts := m.GetContentAsParts()
 	if parts == nil {
-		return "", nil
+		return "", nil, nil
 	}
 	var sb strings.Builder
 	var images []string
@@ -62,15 +69,15 @@ func splitContent(m openai.Message) (string, []string) {
 			sb.WriteString(p.Text)
 		case "image_url":
 			if p.ImageURL != nil {
-				if b64, ok := dataURIToBase64(p.ImageURL.URL); ok {
-					images = append(images, b64)
-				} else if b64, err := fetchImageBase64(p.ImageURL.URL); err == nil {
-					images = append(images, b64)
+				b64, ok := dataURIToBase64(p.ImageURL.URL)
+				if !ok {
+					return "", nil, ErrImageURLNotSupported
 				}
+				images = append(images, b64)
 			}
 		}
 	}
-	return sb.String(), images
+	return sb.String(), images, nil
 }
 
 // dataURIToBase64 returns the base64 payload of a data: URI, true on success.
@@ -84,22 +91,6 @@ func dataURIToBase64(s string) (string, bool) {
 		return "", false
 	}
 	return s[sep+1:], true
-}
-
-func fetchImageBase64(url string) (string, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("image fetch returned %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(data), nil
 }
 
 func toolCallsFromOpenAI(calls []openai.ToolCall) []toolCall {
@@ -136,7 +127,7 @@ func convertTools(tools []openai.Tool) []tool {
 }
 
 // buildChatRequest assembles the Ollama chat body from an OpenAI request.
-func (c *Client) buildChatRequest(req openai.ChatCompletionRequest, stream bool) chatRequest {
+func (c *Client) buildChatRequest(req openai.ChatCompletionRequest, stream bool) (chatRequest, error) {
 	opts := options{}
 	if req.Temperature != nil {
 		opts["temperature"] = *req.Temperature
@@ -157,9 +148,13 @@ func (c *Client) buildChatRequest(req openai.ChatCompletionRequest, stream bool)
 		}
 	}
 
+	messages, err := c.convertMessages(req.Messages)
+	if err != nil {
+		return chatRequest{}, err
+	}
 	out := chatRequest{
 		Model:    req.Model,
-		Messages: c.convertMessages(req.Messages),
+		Messages: messages,
 		Stream:   stream,
 		Options:  opts,
 		Think:    thinkSetting(req),
@@ -167,7 +162,7 @@ func (c *Client) buildChatRequest(req openai.ChatCompletionRequest, stream bool)
 	if len(req.Tools) > 0 {
 		out.Tools = convertTools(req.Tools)
 	}
-	return out
+	return out, nil
 }
 
 func effectiveMaxTokens(req openai.ChatCompletionRequest) int {

@@ -149,7 +149,10 @@ func (c *Client) ChatCompletion(ctx context.Context, req openai.ChatCompletionRe
 	var cumulativeUsage openai.Usage
 	for iteration := 0; iteration < openai.MAX_TOOL_CALL_ITERATIONS; iteration++ {
 		req.Messages = currentMessages
-		ollamaReq := c.buildChatRequest(req, false)
+		ollamaReq, err := c.buildChatRequest(req, false)
+		if err != nil {
+			return nil, err
+		}
 
 		var resp chatResponse
 		if err := c.doRequest(ctx, http.MethodPost, "api/chat", ollamaReq, &resp); err != nil {
@@ -255,7 +258,11 @@ func (c *Client) StreamChatCompletion(ctx context.Context, req openai.ChatComple
 
 		for iteration := 0; iteration < openai.MAX_TOOL_CALL_ITERATIONS; iteration++ {
 			req.Messages = currentMessages
-			ollamaReq := c.buildChatRequest(req, true)
+			ollamaReq, err := c.buildChatRequest(req, true)
+			if err != nil {
+				errorChan <- err
+				return
+			}
 
 			finalResponse, retryMeta, err := c.streamChatCompletion(ctx, ollamaReq, responseChan, hasServers && !requestHasTools)
 			stream.SetRetryMetadata(retryMeta)
