@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -135,8 +136,7 @@ func (c *Client) GetModels(ctx context.Context) (*openai.ModelsResponse, error) 
 	}
 
 	var geminiResp geminiModelResponse
-	endpoint := fmt.Sprintf("models?key=%s", c.apiKey)
-	if err := c.doRequest(ctx, "GET", endpoint, nil, &geminiResp); err != nil {
+	if err := c.doRequest(ctx, "GET", "models", nil, &geminiResp); err != nil {
 		return nil, err
 	}
 
@@ -179,6 +179,11 @@ func (c *Client) CreateEmbedding(ctx context.Context, req openai.EmbeddingReques
 		return nil, fmt.Errorf("invalid input type")
 	}
 
+	// The model is one path segment: escaping it keeps a name containing "/",
+	// "?" or ".." from reaching a different endpoint. GetModels returns IDs
+	// without the "models/" prefix, but accept it too.
+	endpoint := "models/" + url.PathEscape(strings.TrimPrefix(req.Model, "models/")) + ":embedContent"
+
 	embeddings := make([]openai.Embedding, len(content))
 	for i, text := range content {
 		geminiReq := map[string]any{
@@ -197,7 +202,6 @@ func (c *Client) CreateEmbedding(ctx context.Context, req openai.EmbeddingReques
 			} `json:"embedding"`
 		}
 
-		endpoint := fmt.Sprintf("models/%s:embedContent?key=%s", req.Model, c.apiKey)
 		if err := c.doRequest(ctx, "POST", endpoint, geminiReq, &geminiResp); err != nil {
 			return nil, err
 		}
@@ -306,6 +310,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
+		// The key goes in a header, never the URL: errors quote the request
+		// URL, and proxies and access logs record it.
+		if c.apiKey != "" {
+			req.Header.Set("x-goog-api-key", c.apiKey)
+		}
 
 		resp, err := httpClient.Do(req)
 		if err != nil {

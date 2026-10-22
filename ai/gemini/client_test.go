@@ -88,8 +88,11 @@ func TestGetModels_Success(t *testing.T) {
 		if r.URL.Path != "/models" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
-		if got := r.URL.Query().Get("key"); got != "test-key" {
-			t.Errorf("api key = %q, want test-key", got)
+		if got := r.Header.Get("x-goog-api-key"); got != "test-key" {
+			t.Errorf("x-goog-api-key = %q, want test-key", got)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("query = %q, want none (the key must not be in the URL)", r.URL.RawQuery)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
