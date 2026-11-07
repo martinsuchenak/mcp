@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -16,12 +17,17 @@ type sseEvent struct {
 // sseSink is a notificationSink backed by a buffered channel. It is non-blocking:
 // a full buffer drops the event (listChanged is an idempotent re-fetch hint).
 type sseSink struct {
-	ch chan sseEvent
+	ch        chan sseEvent
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func newSSESink(buffer int) *sseSink {
-	return &sseSink{ch: make(chan sseEvent, buffer)}
+	return &sseSink{ch: make(chan sseEvent, buffer), done: make(chan struct{})}
 }
+
+// close ends the stream: the session opened a newer one in its place.
+func (s *sseSink) close() { s.closeOnce.Do(func() { close(s.done) }) }
 
 func (s *sseSink) send(method string, params any) {
 	select {
@@ -66,7 +72,12 @@ func (s *Server) handleSSEStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	sink := newSSESink(64)
-	subID := s.notifications.subscribe(sink)
+	var subID uint64
+	if sessionID := r.Header.Get(headerSessionID); sessionID != "" && s.getSessionManager() != nil {
+		subID = s.notifications.subscribeForSession(sessionID, sink)
+	} else {
+		subID = s.notifications.subscribe(sink)
+	}
 	defer s.notifications.unsubscribe(subID)
 
 	heartbeat := time.NewTicker(30 * time.Second)
@@ -92,6 +103,8 @@ func (s *Server) handleSSEStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
+		case <-sink.done:
+			return // superseded by a newer stream for this session
 		case <-r.Context().Done():
 			return
 		}

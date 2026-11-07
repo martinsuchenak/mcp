@@ -73,7 +73,7 @@ func TestHandleRequest_DeleteSession(t *testing.T) {
 
 	t.Run("manager error", func(t *testing.T) {
 		s := NewServer("test", "1.0")
-		s.SetSessionManager(&erroringSessionManager{deleteErr: errors.New("boom")})
+		s.SetSessionManager(&erroringSessionManager{deleteErr: errors.New("boom"), validResult: true})
 		req := httptest.NewRequest(http.MethodDelete, "/mcp", nil)
 		req.Header.Set(headerSessionID, "sess-1")
 		rr := httptest.NewRecorder()

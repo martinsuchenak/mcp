@@ -55,18 +55,50 @@ type notificationHub struct {
 	mu          sync.RWMutex
 	nextID      uint64
 	subscribers map[uint64]*notificationSubscriber
+	// bySession maps an HTTP session id to its one standalone GET stream.
+	bySession map[string]uint64
 }
 
 func newNotificationHub() *notificationHub {
-	return &notificationHub{subscribers: make(map[uint64]*notificationSubscriber)}
+	return &notificationHub{subscribers: make(map[uint64]*notificationSubscriber), bySession: make(map[string]uint64)}
 }
 
 func (h *notificationHub) subscribe(sink notificationSink) uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.subscribeLocked(sink)
+}
+
+func (h *notificationHub) subscribeLocked(sink notificationSink) uint64 {
 	h.nextID++
 	id := h.nextID
 	h.subscribers[id] = &notificationSubscriber{id: id, sink: sink}
+	return id
+}
+
+// closableSink is a sink that can be told its stream was superseded.
+type closableSink interface {
+	notificationSink
+	close()
+}
+
+// subscribeForSession registers the standalone GET stream of an HTTP
+// session. The Streamable HTTP spec has the server send each message on
+// only one stream and never broadcast it across several, so a session
+// holds one such stream: an earlier one is closed and replaced.
+func (h *notificationHub) subscribeForSession(sessionID string, sink notificationSink) uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if oldID, ok := h.bySession[sessionID]; ok {
+		if old := h.subscribers[oldID]; old != nil {
+			delete(h.subscribers, oldID)
+			if c, ok := old.sink.(closableSink); ok {
+				c.close()
+			}
+		}
+	}
+	id := h.subscribeLocked(sink)
+	h.bySession[sessionID] = id
 	return id
 }
 
@@ -74,6 +106,11 @@ func (h *notificationHub) unsubscribe(id uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.subscribers, id)
+	for sessionID, subID := range h.bySession {
+		if subID == id {
+			delete(h.bySession, sessionID)
+		}
+	}
 }
 
 func (h *notificationHub) broadcast(method string, params any) {

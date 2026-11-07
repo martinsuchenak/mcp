@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -105,11 +106,13 @@ func TestJWTSessionManager_DeleteSession_NoOp(t *testing.T) {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
-	if err := sm.DeleteSession(context.Background(), sessionID); err != nil {
-		t.Fatalf("DeleteSession: %v", err)
+	// JWT sessions cannot be revoked, and DeleteSession says so (the HTTP
+	// transport turns this into a 405 for the client's DELETE).
+	if err := sm.DeleteSession(context.Background(), sessionID); !errors.Is(err, ErrSessionRevocationUnsupported) {
+		t.Fatalf("DeleteSession: %v, want ErrSessionRevocationUnsupported", err)
 	}
 
-	// JWT sessions cannot be revoked: still valid after "deletion".
+	// Still valid after the attempted deletion.
 	valid, err := sm.ValidateSession(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("ValidateSession after delete: %v", err)

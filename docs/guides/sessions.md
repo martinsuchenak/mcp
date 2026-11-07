@@ -98,7 +98,7 @@ When session management is enabled:
 - Returns `MCP-Session-Id` header in the initialize response
 - Clients must include `MCP-Session-Id` on all subsequent requests
 - Server validates session existence and returns 404 if not found
-- Clients can terminate sessions via DELETE requests
+- Clients can terminate sessions via DELETE requests when the session manager can revoke them (Redis); with `JWTSessionManager` a DELETE is answered 405, as the spec allows, since a JWT session only ends when it expires
 
 Session management is **optional** and backwards compatible. Servers without session management enabled work exactly as before.
 

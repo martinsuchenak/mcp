@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -30,6 +31,12 @@ type SessionManager interface {
 	DeleteSession(ctx context.Context, sessionID string) error
 }
 
+// ErrSessionRevocationUnsupported is returned by a SessionManager whose
+// sessions cannot be ended before they expire (JWTSessionManager). The HTTP
+// transport answers a client's DELETE with 405 then, as the Streamable HTTP
+// spec allows, rather than claiming a session is gone while it still works.
+var ErrSessionRevocationUnsupported = errors.New("session revocation not supported")
+
 // JWTSessionManager provides stateless session management using JWT tokens
 // This is the RECOMMENDED approach for production clusters as it:
 // - Requires no external storage (Redis, Database)
@@ -48,6 +55,9 @@ type jwtClaims struct {
 	ShowAll   bool   `json:"show_all,omitempty"`
 	IssuedAt  int64  `json:"iat"`
 	ExpiresAt int64  `json:"exp"`
+	// ID (jti) makes every session id globally unique, as the spec asks:
+	// without it two sessions created in the same second are the same token.
+	ID string `json:"jti,omitempty"`
 }
 
 // NewJWTSessionManager creates a new JWT-based session manager
@@ -85,11 +95,16 @@ func NewJWTSessionManagerWithAutoKey(ttl time.Duration) (*JWTSessionManager, err
 // CreateSession generates a new JWT session token
 func (m *JWTSessionManager) CreateSession(ctx context.Context, protocolVersion string, showAll bool) (string, error) {
 	now := time.Now()
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("failed to generate session id: %w", err)
+	}
 	claims := jwtClaims{
 		Protocol:  protocolVersion,
 		ShowAll:   showAll,
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(m.ttl).Unix(),
+		ID:        base64.RawURLEncoding.EncodeToString(nonce),
 	}
 
 	// Create JWT: header.payload.signature
@@ -134,7 +149,7 @@ func (m *JWTSessionManager) ValidateSession(ctx context.Context, sessionID strin
 	// Verify signature
 	message := headerEncoded + "." + claimsEncoded
 	expectedSignature := m.sign(message)
-	if signature != expectedSignature {
+	if !hmac.Equal([]byte(signature), []byte(expectedSignature)) {
 		return false, nil // Invalid signature
 	}
 
@@ -177,11 +192,12 @@ func (m *JWTSessionManager) GetShowAll(ctx context.Context, sessionID string) (b
 	return claims.ShowAll, nil
 }
 
-// DeleteSession is a no-op for JWT sessions (cannot revoke before expiry)
+// DeleteSession reports ErrSessionRevocationUnsupported: a JWT session
+// cannot be revoked before it expires (the trade-off for being stateless),
+// and saying so lets the HTTP transport answer DELETE with 405 instead of
+// pretending the session ended.
 func (m *JWTSessionManager) DeleteSession(ctx context.Context, sessionID string) error {
-	// JWT sessions cannot be revoked - they expire naturally
-	// This is an acceptable trade-off for the stateless benefits
-	return nil
+	return ErrSessionRevocationUnsupported
 }
 
 // sign creates HMAC-SHA256 signature

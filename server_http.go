@@ -1,9 +1,12 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -53,21 +56,33 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	// Set CORS headers for actual requests
 	w.Header().Set("Access-Control-Allow-Origin", corsOriginHeader(origin))
 
-	// Handle DELETE requests (session termination)
+	// Handle DELETE requests (session termination, Streamable HTTP). The
+	// spec lets a server answer 405 when it does not allow clients to end
+	// sessions; a session manager that cannot revoke (JWTSessionManager)
+	// says so with ErrSessionRevocationUnsupported, so the client is not
+	// told a session is gone while it keeps working. After a real
+	// termination the session id answers 404 like any unknown one.
 	if r.Method == http.MethodDelete {
 		sm := s.getSessionManager()
 		if sm == nil {
+			w.Header().Set("Allow", "POST, GET, OPTIONS")
 			http.Error(w, "Session management not enabled", http.StatusMethodNotAllowed)
 			return
 		}
-
-		sessionID := r.Header.Get(headerSessionID)
-		if sessionID == "" {
-			http.Error(w, "MCP-Session-Id header required", http.StatusBadRequest)
+		if _, ok := negotiateProtocolVersion(r.Header.Get(headerProtocolVersion), "2025-03-26"); !ok {
+			http.Error(w, "Unsupported MCP-Protocol-Version", http.StatusBadRequest)
 			return
 		}
-
-		if err := sm.DeleteSession(r.Context(), sessionID); err != nil {
+		if _, ok, status, message := s.checkSession(r.Context(), r); !ok {
+			http.Error(w, message, status)
+			return
+		}
+		if err := sm.DeleteSession(r.Context(), r.Header.Get(headerSessionID)); err != nil {
+			if errors.Is(err, ErrSessionRevocationUnsupported) {
+				w.Header().Set("Allow", "POST, GET, OPTIONS")
+				http.Error(w, "Session termination not supported", http.StatusMethodNotAllowed)
+				return
+			}
 			http.Error(w, fmt.Sprintf("Failed to delete session: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -80,11 +95,11 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	// notifications, but only when the client asks for an event stream (the
 	// Streamable HTTP push channel). A plain GET stays a 405.
 	if r.Method == http.MethodGet {
-		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		if acceptsEventStream(r.Header.Get("Accept")) {
 			s.handleSSEStream(w, r)
 			return
 		}
-		w.Header().Set("Allow", "POST, OPTIONS")
+		w.Header().Set("Allow", "POST, GET, DELETE, OPTIONS")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -102,19 +117,25 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req MCPRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendProtocolAwareError(w, r, &req, nil, ErrorCodeParseError, "Parse error", map[string]any{
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.sendProtocolAwareError(w, r, &MCPRequest{}, nil, ErrorCodeParseError, "Parse error", map[string]any{
 			"details": err.Error(),
 		})
 		return
 	}
+	raw = bytes.TrimSpace(raw)
 
-	// Validate JSONRPC version
-	if req.JSONRPC != "2.0" {
-		s.sendProtocolAwareError(w, r, &req, req.ID, ErrorCodeInvalidRequest, "Invalid Request", map[string]any{
-			"details": "JSONRPC field must be '2.0'",
-		})
+	// A JSON array is a JSON-RPC batch: required of a 2025-03-26 (and
+	// 2024-11-05) server, withdrawn by 2025-06-18 and later revisions.
+	if len(raw) > 0 && raw[0] == '[' {
+		s.handleLegacyBatch(w, r, raw)
+		return
+	}
+
+	var req MCPRequest
+	if perr := decodeMCPRequest(raw, &req); perr != nil {
+		s.sendProtocolAwareError(w, r, &req, req.ID, perr.Code, perr.Message, perr.Data)
 		return
 	}
 
@@ -126,16 +147,18 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	// (notifications/initialized, notifications/cancelled), so accepting is
 	// all there is to do. Deliberately lenient: a response is accepted even
 	// though 2026-07-28 forbids clients from sending one (a response carries
-	// no era signal to reject it by), and this runs before session/version
-	// checks, since an ignored message needs no validated context.
+	// no era signal to reject it by). A Legacy message is still checked for
+	// a valid MCP-Protocol-Version and session first: the spec requires a
+	// 400/404 for those, whatever the message, and a client must learn its
+	// session is gone from the first message it sends, not the first request.
 	if (req.ID == nil && req.Method != "") || (req.ID != nil && req.Method == "") {
+		if !isModernRequest(r, &req) {
+			if _, ok := s.legacyPreflight(w, r, nil); !ok {
+				return
+			}
+		}
 		w.WriteHeader(http.StatusAccepted)
 		return
-	}
-
-	// Ensure ID is never nil - use empty string as default
-	if req.ID == nil {
-		req.ID = ""
 	}
 
 	// Modern-era (protocol revision 2026-07-28+) requests are detected from
@@ -148,45 +171,173 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For non-initialize requests, validate MCP-Protocol-Version header
+	// For non-initialize requests, validate MCP-Protocol-Version header and session.
 	if req.Method != "initialize" {
-		// Per spec: assume 2025-03-26 if missing for backwards compatibility
-		protocolVersion, versionOK := negotiateProtocolVersion(r.Header.Get(headerProtocolVersion), "2025-03-26")
-
-		// Validate protocol version. Still a 400 (this rejects a header, not
-		// a JSON-RPC method call, so it stays outside the "Legacy JSON-RPC
-		// errors are always 200" convention — same as it always has been),
-		// but now with a proper JSON-RPC error body naming what this Legacy
-		// server actually supports (mirroring handleInitialize's identical
-		// check on the initialize request itself, mcp.go below), rather
-		// than the plain-text, no-body response this used to send, which
-		// left a client with no way to learn a version it could retry with.
-		// writeModernProtocolError just means "JSON-RPC error at this HTTP
-		// status" despite the name — nothing about it is Modern-specific.
-		if !versionOK {
-			s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeInvalidParams,
-				fmt.Sprintf("Unsupported MCP-Protocol-Version: %s", protocolVersion), map[string]any{
-					"requested": protocolVersion,
-					"supported": supportedProtocolVersions,
-				})
+		var ok bool
+		if r, ok = s.legacyPreflight(w, r, req.ID); !ok {
 			return
-		}
-
-		// Validate session ID if session management is enabled
-		if showAll, ok, status, message := s.checkSession(r.Context(), r); !ok {
-			http.Error(w, message, status)
-			return
-		} else if showAll {
-			r = r.WithContext(WithShowAllTools(r.Context()))
-		} else if sm := s.getSessionManager(); sm == nil {
-			// No session management - check header/query on each request
-			if GetShowAllFromRequest(r) {
-				r = r.WithContext(WithShowAllTools(r.Context()))
-			}
 		}
 	}
 
 	s.dispatchResponse(w, r, &req, legacyShape)
+}
+
+// decodeMCPRequest parses one JSON-RPC message, keeping integer ids exact
+// (a float64 would round ids above 2^53) and enforcing the base protocol's
+// id rules: an id, when present, is a string or an integer and never null.
+// The returned error is the JSON-RPC error to answer with; req.ID is set
+// when it could be read.
+func decodeMCPRequest(raw []byte, req *MCPRequest) *MCPError {
+	var wire struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Params  any             `json:"params"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&wire); err != nil {
+		return &MCPError{Code: ErrorCodeParseError, Message: "Parse error", Data: map[string]any{"details": err.Error()}}
+	}
+	req.JSONRPC, req.Method, req.Params = wire.JSONRPC, wire.Method, wire.Params
+	if len(wire.ID) > 0 {
+		id, ok := decodeJSONRPCID(wire.ID)
+		if !ok {
+			return &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request", Data: map[string]any{
+				"details": "id must be a string or an integer, and must not be null",
+			}}
+		}
+		req.ID = id
+	}
+	if req.JSONRPC != "2.0" {
+		return &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request", Data: map[string]any{
+			"details": "JSONRPC field must be '2.0'",
+		}}
+	}
+	if req.Method == "" && req.ID == nil {
+		return &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request", Data: map[string]any{
+			"details": "a request or notification needs a method; a response needs an id",
+		}}
+	}
+	return nil
+}
+
+// decodeJSONRPCID accepts a string or integer id (as json.Number, echoed
+// back exactly), rejecting null, fractional numbers, objects and arrays.
+func decodeJSONRPCID(raw json.RawMessage) (any, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, false
+	}
+	switch id := v.(type) {
+	case string:
+		return id, true
+	case json.Number:
+		if _, err := id.Int64(); err != nil {
+			return nil, false
+		}
+		return id, true
+	}
+	return nil, false
+}
+
+// legacyPreflight applies the checks every Legacy message but initialize
+// must pass before it is acted on: a supported MCP-Protocol-Version header
+// (400 otherwise, with a JSON-RPC body naming the supported versions) and,
+// when session management is on, a valid MCP-Session-Id (400 when missing,
+// 404 when unknown or expired). ok is false once the error has been
+// written. The returned request carries the session's show-all flag.
+func (s *Server) legacyPreflight(w http.ResponseWriter, r *http.Request, id any) (*http.Request, bool) {
+	// Per spec: assume 2025-03-26 if missing for backwards compatibility
+	protocolVersion, versionOK := negotiateProtocolVersion(r.Header.Get(headerProtocolVersion), "2025-03-26")
+
+	// Still a 400 (this rejects a header, not a JSON-RPC method call, so it
+	// stays outside the "Legacy JSON-RPC errors are always 200" convention),
+	// with a proper JSON-RPC error body naming what this server supports.
+	// writeModernProtocolError just means "JSON-RPC error at this HTTP
+	// status" despite the name — nothing about it is Modern-specific.
+	if !versionOK {
+		s.writeModernProtocolError(w, id, http.StatusBadRequest, ErrorCodeInvalidParams,
+			fmt.Sprintf("Unsupported MCP-Protocol-Version: %s", protocolVersion), map[string]any{
+				"requested": protocolVersion,
+				"supported": supportedProtocolVersions,
+			})
+		return r, false
+	}
+
+	if showAll, ok, status, message := s.checkSession(r.Context(), r); !ok {
+		http.Error(w, message, status)
+		return r, false
+	} else if showAll {
+		r = r.WithContext(WithShowAllTools(r.Context()))
+	} else if sm := s.getSessionManager(); sm == nil {
+		// No session management - check header/query on each request
+		if GetShowAllFromRequest(r) {
+			r = r.WithContext(WithShowAllTools(r.Context()))
+		}
+	}
+	return r, true
+}
+
+// batchProtocolVersions are the Legacy revisions whose Streamable HTTP
+// transport lets a client POST a JSON-RPC batch; 2025-06-18 removed it.
+var batchProtocolVersions = map[string]bool{"2024-11-05": true, "2025-03-26": true}
+
+// handleLegacyBatch serves a JSON-RPC batch (a JSON array) for the revisions
+// that allow one: each request is dispatched in turn and the responses are
+// returned as an array, or 202 when the batch holds only notifications
+// (and responses). Later revisions get 400 Invalid Request, since a batch is
+// input the server cannot accept there.
+func (s *Server) handleLegacyBatch(w http.ResponseWriter, r *http.Request, raw []byte) {
+	var ok bool
+	if r, ok = s.legacyPreflight(w, r, nil); !ok {
+		return
+	}
+	version, _ := negotiateProtocolVersion(r.Header.Get(headerProtocolVersion), "2025-03-26")
+	if !batchProtocolVersions[version] {
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeInvalidRequest, "Invalid Request", map[string]any{
+			"details": "JSON-RPC batching is not supported in protocol version " + version,
+		})
+		return
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeParseError, "Parse error", map[string]any{"details": err.Error()})
+		return
+	}
+	if len(items) == 0 {
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeInvalidRequest, "Invalid Request", map[string]any{"details": "empty batch"})
+		return
+	}
+
+	responses := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		var req MCPRequest
+		if perr := decodeMCPRequest(bytes.TrimSpace(item), &req); perr != nil {
+			body, _ := json.Marshal(MCPResponse{JSONRPC: "2.0", ID: req.ID, Error: perr})
+			responses = append(responses, body)
+			continue
+		}
+		if req.ID == nil || req.Method == "" {
+			continue // notification or response: accepted, nothing to answer
+		}
+		capture := newModernResponseCapture()
+		s.dispatchMethod(capture, r, &req)
+		if sid := capture.Header().Get(headerSessionID); sid != "" {
+			w.Header().Set(headerSessionID, sid) // initialize inside a batch
+		}
+		responses = append(responses, bytes.TrimSpace(capture.body.Bytes()))
+	}
+	if len(responses) == 0 {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(responses)
 }
 
 // dispatchMethod routes a parsed request to its handler. Both the Legacy path
