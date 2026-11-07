@@ -26,13 +26,16 @@ func TestBearerTokenAuth(t *testing.T) {
 // TestDiscoverOAuthMeta_OAuthWellKnown verifies DiscoverOAuthMeta finds
 // metadata at the RFC 8414 well-known path.
 func TestDiscoverOAuthMeta_OAuthWellKnown(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/.well-known/oauth-authorization-server" {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(OAuthMeta{
-				AuthorizationEndpoint: "https://example.com/authorize",
-				TokenEndpoint:         "https://example.com/token",
-				RegistrationEndpoint:  "https://example.com/register",
+				Issuer:                        ts.URL,
+				AuthorizationEndpoint:         "https://example.com/authorize",
+				TokenEndpoint:                 "https://example.com/token",
+				RegistrationEndpoint:          "https://example.com/register",
+				CodeChallengeMethodsSupported: []string{"S256"},
 			})
 			return
 		}
@@ -53,20 +56,26 @@ func TestDiscoverOAuthMeta_OAuthWellKnown(t *testing.T) {
 	if meta.RegistrationEndpoint != "https://example.com/register" {
 		t.Errorf("RegistrationEndpoint = %q", meta.RegistrationEndpoint)
 	}
+	if meta.Resource != ts.URL {
+		t.Errorf("Resource = %q, want the server URL %q", meta.Resource, ts.URL)
+	}
 }
 
 // TestDiscoverOAuthMeta_OIDCFallback verifies DiscoverOAuthMeta falls back to
 // the OIDC well-known path when the RFC 8414 path 404s.
 func TestDiscoverOAuthMeta_OIDCFallback(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/oauth-authorization-server":
 			http.NotFound(w, r)
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(OAuthMeta{
-				AuthorizationEndpoint: "https://example.com/authorize",
-				TokenEndpoint:         "https://example.com/token",
+				Issuer:                        ts.URL,
+				AuthorizationEndpoint:         "https://example.com/authorize",
+				TokenEndpoint:                 "https://example.com/token",
+				CodeChallengeMethodsSupported: []string{"S256"},
 			})
 		default:
 			http.NotFound(w, r)
@@ -109,6 +118,9 @@ func TestRegisterOAuthClient(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body["client_name"] != "my-client" {
 			t.Errorf("client_name = %v, want my-client", body["client_name"])
+		}
+		if body["application_type"] != "web" {
+			t.Errorf("application_type = %v, want web", body["application_type"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"client_id": "abc123"})
