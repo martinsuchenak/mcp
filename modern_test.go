@@ -79,6 +79,26 @@ func TestIsModernRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("Mcp-Method with a Legacy MCP-Protocol-Version is legacy", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		r.Header.Set(headerMcpMethod, "tools/call")
+		r.Header.Set(headerProtocolVersion, "2025-11-25")
+		req := &MCPRequest{Method: "tools/call", Params: map[string]any{"name": "t"}}
+		if isModernRequest(r, req) {
+			t.Fatal("expected false: a Legacy client that also sends Mcp-Method")
+		}
+	})
+
+	t.Run("Mcp-Method with the Modern MCP-Protocol-Version is modern", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		r.Header.Set(headerMcpMethod, "tools/list")
+		r.Header.Set(headerProtocolVersion, MCPProtocolVersionModern)
+		req := &MCPRequest{Method: "tools/list", Params: map[string]any{}}
+		if !isModernRequest(r, req) {
+			t.Fatal("expected true for a Modern client")
+		}
+	})
+
 	t.Run("_meta.protocolVersion alone is a modern signal (e.g. stdio)", func(t *testing.T) {
 		req := &MCPRequest{
 			Method: "tools/list",
@@ -88,6 +108,53 @@ func TestIsModernRequest(t *testing.T) {
 			t.Fatal("expected true when _meta.protocolVersion is present, even with a nil *http.Request")
 		}
 	})
+}
+
+// A Legacy client that adds the Modern per-request headers (mcp-remote and
+// Claude Code send Mcp-Method and Mcp-Name with MCP-Protocol-Version
+// 2025-11-25 and no _meta version) must be served on the Legacy path, not
+// refused with a header/body version mismatch.
+func TestLegacyClientWithMcpMethodHeader(t *testing.T) {
+	s := NewServer("legacy-headers", "1")
+	s.RegisterTool(NewTool("echo", "echoes"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+		return NewToolResponseText("ok"), nil
+	})
+	srv := httptest.NewServer(http.HandlerFunc(s.HandleRequest))
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		method string
+		params map[string]any
+	}{
+		{"tools/list", map[string]any{}},
+		{"tools/call", map[string]any{"name": "echo", "arguments": map[string]any{}}},
+	} {
+		body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": tc.method, "params": tc.params})
+		req, _ := http.NewRequest(http.MethodPost, srv.URL, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set(headerProtocolVersion, "2025-11-25")
+		req.Header.Set(headerMcpMethod, tc.method)
+		if name, ok := tc.params["name"].(string); ok {
+			req.Header.Set(headerMcpName, name)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status %d, body %s", tc.method, resp.StatusCode, raw)
+		}
+		out := decodeMCPResponse(t, raw)
+		if out["error"] != nil {
+			t.Fatalf("%s: error %v", tc.method, out["error"])
+		}
+		if tc.method == "tools/call" && !strings.Contains(string(raw), `"ok"`) {
+			t.Fatalf("tools/call: unexpected result %s", raw)
+		}
+	}
 }
 
 // --- server/discover ------------------------------------------------------

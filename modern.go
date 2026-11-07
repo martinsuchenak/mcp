@@ -70,6 +70,19 @@ func isSupportedModernProtocolVersion(version string) bool {
 	return false
 }
 
+// isLegacyProtocolVersion reports whether version names a Legacy-era
+// revision this server supports (the MCP-Protocol-Version a Legacy client
+// sends after initialize).
+func isLegacyProtocolVersion(version string) bool {
+	version = strings.TrimSpace(version)
+	for _, legacy := range supportedProtocolVersions {
+		if legacy == version {
+			return true
+		}
+	}
+	return false
+}
+
 // allSupportedProtocolVersions lists every protocol version this dual-era
 // server accepts — Modern revisions first, then Legacy — for the wire places
 // that must describe the whole server, not one era: server/discover's
@@ -94,8 +107,14 @@ func allSupportedProtocolVersions() []string {
 // Mcp-Method header (HTTP-only), or the io.modelcontextprotocol/protocolVersion
 // _meta field (any transport). A Legacy request has neither and is completely
 // unaffected.
+//
+// Mcp-Method alone is not proof: Legacy clients send it too (mcp-remote and
+// Claude Code add Mcp-Method and Mcp-Name to every request while negotiating
+// 2025-11-25), with MCP-Protocol-Version naming a Legacy revision and no
+// _meta version. Such a request stays on the Legacy path; treating it as
+// Modern would fail it with a header/body version mismatch.
 func isModernRequest(r *http.Request, req *MCPRequest) bool {
-	if r != nil && r.Header.Get(headerMcpMethod) != "" {
+	if r != nil && r.Header.Get(headerMcpMethod) != "" && !isLegacyProtocolVersion(r.Header.Get(headerProtocolVersion)) {
 		return true
 	}
 	_, meta := modernRequestParams(req)
