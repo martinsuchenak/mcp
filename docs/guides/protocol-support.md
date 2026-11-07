@@ -149,10 +149,12 @@ server.Shutdown()
 httpServer.Shutdown(ctx)
 ```
 
-Not implemented over stdio: stdio's existing connection-scoped notification
-delivery already reaches every connected client regardless of era, so nothing
-is functionally lost, and a stdio client that calls `subscriptions/listen`
-gets a standard `Method not found` rather than a partial implementation.
+Over stdio, `subscriptions/listen` works the same way: the acknowledgement is
+written first, each notification carries the subscription id (the request's
+own id), the client ends it with `notifications/cancelled`, and `Shutdown()`
+answers it with a completion result. A Modern stdio client receives no
+unsolicited notifications; a Legacy stdio client receives them once its
+`initialize` negotiated a revision that advertises `listChanged`.
 
 ### Icons
 

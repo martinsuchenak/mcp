@@ -141,7 +141,7 @@ func (s *Server) emitNotification(method string, params any) {
 	s.notifications.broadcast(method, params)
 }
 
-// NotifyToolsChanged emits notifications/tools/listChanged to every connected
+// NotifyToolsChanged emits notifications/tools/list_changed to every connected
 // client, signalling that its cached tool list is stale and should be re-fetched.
 //
 // RegisterTool, RegisterTools and UnregisterTool emit this automatically. Call
@@ -152,14 +152,14 @@ func (s *Server) NotifyToolsChanged() {
 	s.emitNotification(NotificationToolsChanged, nil)
 }
 
-// NotifyResourcesChanged emits notifications/resources/listChanged. Register*,
+// NotifyResourcesChanged emits notifications/resources/list_changed. Register*,
 // UnregisterResource and RegisterResourceTemplate emit automatically; call this
 // for external/resource-provider changes.
 func (s *Server) NotifyResourcesChanged() {
 	s.emitNotification(NotificationResourcesChanged, nil)
 }
 
-// NotifyPromptsChanged emits notifications/prompts/listChanged. RegisterPrompt
+// NotifyPromptsChanged emits notifications/prompts/list_changed. RegisterPrompt
 // and UnregisterPrompt emit automatically; call this for external/prompt-provider
 // changes.
 func (s *Server) NotifyPromptsChanged() {

@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
 // OnToolsChanged registers a callback fired whenever a
-// notifications/tools/listChanged arrives from the server (HTTP SSE or stdio).
+// notifications/tools/list_changed arrives from the server (HTTP SSE or stdio).
 // The client also invalidates its own tool cache automatically; use this to
 // trigger application-level refreshes (e.g. re-pulling for a UI). Returns the
 // client for chaining.
@@ -23,7 +24,7 @@ func (c *Client) OnToolsChanged(fn func()) *Client {
 	return c
 }
 
-// OnResourcesChanged registers a callback for notifications/resources/listChanged.
+// OnResourcesChanged registers a callback for notifications/resources/list_changed.
 func (c *Client) OnResourcesChanged(fn func()) *Client {
 	c.mu.Lock()
 	c.onResourcesChanged = fn
@@ -31,7 +32,7 @@ func (c *Client) OnResourcesChanged(fn func()) *Client {
 	return c
 }
 
-// OnPromptsChanged registers a callback for notifications/prompts/listChanged.
+// OnPromptsChanged registers a callback for notifications/prompts/list_changed.
 func (c *Client) OnPromptsChanged(fn func()) *Client {
 	c.mu.Lock()
 	c.onPromptsChanged = fn
@@ -42,7 +43,7 @@ func (c *Client) OnPromptsChanged(fn func()) *Client {
 // EnableNotifications opts the HTTP client into receiving server-pushed
 // notifications over a long-lived SSE stream. When enabled, the client opens a
 // background GET event-stream connection after Initialize, invalidates its tool
-// cache on notifications/tools/listChanged, and fires any On*Changed callbacks.
+// cache on notifications/tools/list_changed, and fires any On*Changed callbacks.
 //
 // Notifications are off by default: a long-lived connection is only wanted when
 // the caller intends to consume change events, and it must be released with
@@ -127,9 +128,27 @@ func (c *Client) startStreamSubscription() {
 	c.readerStarted = true
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	ctx := c.ctx
+
+	// The server acknowledges a subscription before sending anything on
+	// it; waiting (briefly) for that acknowledgement means a change made
+	// right after Initialize returns is not emitted to a subscription that
+	// does not exist yet.
+	acked := make(chan struct{})
+	var ackOnce sync.Once
+	if st.peer != nil {
+		st.peer.Handle("notifications/subscriptions/acknowledged", func(ctx context.Context, params json.RawMessage) (any, error) {
+			ackOnce.Do(func() { close(acked) })
+			return nil, nil
+		})
+	}
+	settled := make(chan struct{}) // closed when the first attempt is answered or acknowledged
+	var settleOnce sync.Once
+	settle := func() { settleOnce.Do(func() { close(settled) }) }
+
 	c.readerWG.Add(1)
 	go func() {
 		defer c.readerWG.Done()
+		defer settle()
 		for ctx.Err() == nil {
 			req := c.withModernMeta(c.listenRequest())
 			var resp MCPResponse
@@ -150,6 +169,11 @@ func (c *Client) startStreamSubscription() {
 			}
 		}
 	}()
+	select {
+	case <-acked:
+	case <-settled:
+	case <-time.After(2 * time.Second):
+	}
 }
 
 // eventStreamConnect performs one event-stream connection attempt.
