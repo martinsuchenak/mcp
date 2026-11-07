@@ -59,7 +59,11 @@ Notifications are off by default because a long-lived connection is only wanted 
 
 ## Client: receiving notifications (stdio)
 
-stdio clients always receive notifications (the transport is already a persistent connection) — no `EnableNotifications` call is needed. The same `On*Changed` callbacks fire, and the tool cache is invalidated automatically:
+stdio clients need no `EnableNotifications` call — the transport is already a persistent connection. The same `On*Changed` callbacks fire, and the tool cache is invalidated automatically:
+
+- **Legacy server:** the server sends list-changed notifications on the connection, and the client receives them.
+- **Modern (2026-07-28) server:** the server sends them only on a `subscriptions/listen` request, so after `Initialize` the client opens one automatically (for tools, resources and prompts) and keeps it open until `Close`, which cancels it. A server that does not implement `subscriptions/listen` over stdio answers Method not found, and the client then receives no change notifications; this library's own `Server` is such a server, but it also sends every connected stdio client its notifications on the connection, so nothing is lost against it.
+- Clients built with `NewStdioClient` or `NewStreamClient` receive notifications. A client over a bare `jsonrpc.Client` has no inbound message handler and receives none.
 
 ```go
 client, _ := mcp.NewStdioClient("my-server", nil, "")

@@ -272,8 +272,8 @@ func (c *Client) applyLegacyHeaders(h http.Header, method string) {
 	if method == "initialize" {
 		return
 	}
-	if c.sessionID != "" {
-		h.Set(headerSessionID, c.sessionID)
+	if sessionID := c.getSessionID(); sessionID != "" {
+		h.Set(headerSessionID, sessionID)
 	}
 	if c.protocolVersion != "" {
 		h.Set(headerProtocolVersion, c.protocolVersion)

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -387,57 +389,44 @@ func TestClient_ModernDetection_RetriesWithServerAdvertisedVersion(t *testing.T)
 	}
 }
 
-// TestClient_ModernDetection_FallsBackToLegacyWhenNoOverlap proves the
-// retry is bounded and correctly gives up when the server's
-// UnsupportedProtocolVersion error offers nothing new to try (e.g. it only
-// re-lists the exact version already rejected) — a genuine incompatibility,
-// not the "even newer version" case, so Legacy fallback is the right call.
-func TestClient_ModernDetection_FallsBackToLegacyWhenNoOverlap(t *testing.T) {
-	s := NewServer("legacy-fallback", "1")
-	s.RegisterTool(NewTool("echo", "echoes"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
-		return NewToolResponseText("ok"), nil
-	})
-
+// TestClient_ModernDetection_NoUsableModernVersionIsAnError proves the
+// retry is bounded and, when the server's UnsupportedProtocolVersion error
+// offers nothing new to try (it only re-lists the Modern version already
+// rejected), Initialize fails instead of falling back to Legacy: the error
+// is a recognized Modern error, so the server speaks a Modern revision and
+// the client must not send initialize (2026-07-28 Streamable HTTP
+// §Backward Compatibility).
+func TestClient_ModernDetection_NoUsableModernVersionIsAnError(t *testing.T) {
+	var sawInitialize atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var rpc MCPRequest
 		_ = json.Unmarshal(body, &rpc)
-		if rpc.Method == "server/discover" {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(MCPResponse{
-				JSONRPC: "2.0",
-				ID:      rpc.ID,
-				Error: &MCPError{
-					Code:    ErrorCodeUnsupportedProtocolVersion,
-					Message: "Unsupported protocol version",
-					Data:    map[string]any{"supported": []string{MCPProtocolVersionModern}, "requested": MCPProtocolVersionModern},
-				},
-			})
-			return
+		if rpc.Method == "initialize" {
+			sawInitialize.Store(true)
 		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		s.HandleRequest(w, r)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(MCPResponse{
+			JSONRPC: "2.0",
+			ID:      rpc.ID,
+			Error: &MCPError{
+				Code:    ErrorCodeUnsupportedProtocolVersion,
+				Message: "Unsupported protocol version",
+				Data:    map[string]any{"supported": []string{MCPProtocolVersionModern}, "requested": MCPProtocolVersionModern},
+			},
+		})
 	}))
 	defer ts.Close()
 
 	c := NewClient(ts.URL, nil, "")
-	if err := c.Initialize(context.Background()); err != nil {
-		t.Fatalf("Initialize: %v", err)
+	err := c.Initialize(context.Background())
+	var toolErr *ToolError
+	if !errors.As(err, &toolErr) || toolErr.Code != ErrorCodeUnsupportedProtocolVersion {
+		t.Fatalf("Initialize err = %v, want the server's UnsupportedProtocolVersion error", err)
 	}
-	c.mu.RLock()
-	era := c.era
-	c.mu.RUnlock()
-	if era != eraLegacy {
-		t.Fatalf("era = %v, want eraLegacy — data.supported offered nothing not already tried", era)
-	}
-
-	tools, err := c.ListTools(context.Background())
-	if err != nil {
-		t.Fatalf("ListTools: %v", err)
-	}
-	if len(tools) != 1 || tools[0].Name != "echo" {
-		t.Fatalf("unexpected tools: %+v", tools)
+	if sawInitialize.Load() {
+		t.Fatal("client fell back to initialize against a Modern server")
 	}
 }
 

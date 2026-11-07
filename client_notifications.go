@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -44,8 +46,9 @@ func (c *Client) OnPromptsChanged(fn func()) *Client {
 //
 // Notifications are off by default: a long-lived connection is only wanted when
 // the caller intends to consume change events, and it must be released with
-// [Client.Close]. stdio clients always receive notifications (no opt-in needed)
-// because their transport is already a persistent connection.
+// [Client.Close]. stdio clients need no opt-in, because their transport is
+// already a persistent connection; against a Modern server they subscribe
+// with subscriptions/listen automatically (see startStreamSubscription).
 //
 // Returns the client for chaining. Safe to call before or after Initialize.
 func (c *Client) EnableNotifications() *Client {
@@ -89,77 +92,184 @@ func (c *Client) startNotifications(era clientEra) {
 	go func() {
 		defer c.readerWG.Done()
 		if era == eraModern {
-			c.runEventStreamReader(ctx, "subscriptions/listen", c.connectModernSubscription)
+			c.runEventStreamReader(ctx, "subscriptions/listen", false, c.connectModernSubscription)
 		} else {
-			c.runEventStreamReader(ctx, "event stream", c.connectLegacySSE)
+			c.runEventStreamReader(ctx, "event stream", true, c.connectLegacySSE)
 		}
 	}()
 }
 
-// runEventStreamReader maintains a long-lived event-stream connection,
-// reconnecting with exponential backoff (1s initial, doubling to a 30s cap)
-// after transient failures until the context is cancelled. label names the
-// connection in error messages; connect performs one connection attempt and
-// returns the response plus translate, which maps each inbound notification's
-// method name to the constant handleNotification expects (identity for the
-// Legacy reader; the Modern subscription reader reverses the snake_case
-// renaming). ok=false from translate drops the message.
-func (c *Client) runEventStreamReader(ctx context.Context, label string, connect func(ctx context.Context) (*http.Response, func(string) (string, bool), error)) {
+// startStreamSubscription opens a Modern-era subscriptions/listen request
+// on a stream transport (stdio), once, and keeps it open until Close. The
+// request's own id is the subscription id; the server's acknowledgement and
+// the list-changed notifications it then sends (carrying that id in
+// _meta io.modelcontextprotocol/subscriptionId) arrive as ordinary inbound
+// notifications, which the peer's handlers route to handleNotification
+// exactly as the HTTP subscription reader does. Close cancels the request,
+// which sends notifications/cancelled for it and so ends the subscription.
+//
+// A server that does not implement subscriptions/listen on stdio (Method not
+// found, or any other error) simply leaves the client without change
+// notifications; a subscription the server completes (e.g. on shutdown) is
+// reopened after a short delay. A transport that cannot receive inbound
+// messages (no peer) never subscribes. Safe under c.mu: only readerMu is
+// taken.
+func (c *Client) startStreamSubscription() {
+	st, ok := c.transport.(*stdioTransport)
+	if !ok || !st.receivesNotifications() {
+		return
+	}
+	c.readerMu.Lock()
+	defer c.readerMu.Unlock()
+	if c.readerStarted {
+		return
+	}
+	c.readerStarted = true
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	ctx := c.ctx
+	c.readerWG.Add(1)
+	go func() {
+		defer c.readerWG.Done()
+		for ctx.Err() == nil {
+			req := c.withModernMeta(c.listenRequest())
+			var resp MCPResponse
+			err := st.roundTrip(ctx, req, &resp, nil)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil || resp.Error != nil {
+				if resp.Error != nil && resp.Error.Code != ErrorCodeMethodNotFound {
+					slog.Warn("mcp: subscriptions/listen failed; change notifications unavailable", "code", resp.Error.Code, "message", resp.Error.Message)
+				}
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}()
+}
+
+// eventStreamConnect performs one event-stream connection attempt.
+// lastEventID is the id of the last event received on an earlier connection
+// ("" if none), for a Legacy reconnect's Last-Event-ID header. It returns the
+// response plus translate, which maps each inbound notification's method name
+// to the one handleNotification expects; ok=false from translate drops the
+// message.
+type eventStreamConnect func(ctx context.Context, lastEventID string) (*http.Response, func(string) (string, bool), error)
+
+// errStreamNotOffered is returned by readEventStream when the server answers
+// the connection with 405 Method Not Allowed: it does not offer the stream at
+// all (2025-11-25 §Listening for Messages from the Server), so retrying is
+// pointless.
+var errStreamNotOffered = errors.New("server does not offer an event stream (405)")
+
+// eventStreamState is what one connection leaves behind for the next: the
+// SSE id of the last event received (sent back as Last-Event-ID) and the
+// server's last retry field.
+type eventStreamState struct {
+	lastEventID string
+	retry       time.Duration
+}
+
+// runEventStreamReader maintains a long-lived event-stream connection until
+// the context is cancelled. After a connection ends it waits the larger of
+// the server's SSE retry field (which the client MUST respect, 2025-11-25
+// §Resumability and Redelivery) and an exponential backoff (1s initial,
+// doubling to a 30s cap after failed connection attempts, reset after a
+// successful one), then reconnects. A Legacy reconnect carries Last-Event-ID
+// so the server can replay what was missed. A 405 ends the reader for good:
+// the server does not offer the stream. label names the connection in log
+// messages; legacy selects Legacy-only behaviour (resumption, answering
+// server requests).
+func (c *Client) runEventStreamReader(ctx context.Context, label string, legacy bool, connect eventStreamConnect) {
 	backoff := time.Second
+	var state eventStreamState
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		err := c.readEventStream(ctx, label, connect)
+		connected, err := c.readEventStream(ctx, legacy, connect, &state)
 		if ctx.Err() != nil {
 			return
 		}
-		if err == nil {
+		if errors.Is(err, errStreamNotOffered) {
+			slog.Info("mcp: server does not offer a notification stream; not retrying", "server", c.baseURL, "stream", label)
+			return
+		}
+		if connected {
 			backoff = time.Second
-			continue
+		}
+		delay := backoff
+		if state.retry > delay {
+			delay = state.retry
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(delay):
 		}
-		backoff *= 2
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
+		if !connected {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
 		}
 	}
 }
 
 // readEventStream opens one event-stream connection via connect and blocks
-// reading notifications until the stream ends or the context is cancelled.
-func (c *Client) readEventStream(ctx context.Context, label string, connect func(ctx context.Context) (*http.Response, func(string) (string, bool), error)) error {
-	resp, translate, err := connect(ctx)
+// reading it until the stream ends or the context is cancelled. connected
+// reports whether the server accepted the connection (200), so the caller
+// can reset its backoff. state carries the resumption cursor and retry delay
+// across connections.
+func (c *Client) readEventStream(ctx context.Context, legacy bool, connect eventStreamConnect, state *eventStreamState) (connected bool, err error) {
+	lastEventID := ""
+	if legacy {
+		lastEventID = state.lastEventID
+	}
+	resp, translate, err := connect(ctx, lastEventID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusMethodNotAllowed {
+		return false, errStreamNotOffered
+	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s returned status %d", label, resp.StatusCode)
+		return false, fmt.Errorf("event stream returned status %d", resp.StatusCode)
 	}
 
 	reader := newSSEReader(resp.Body)
+	reader.LastEventID, reader.idBuf, reader.Retry = state.lastEventID, state.lastEventID, state.retry
+	defer func() {
+		state.lastEventID, state.retry = reader.LastEventID, reader.Retry
+	}()
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return true, nil
 		}
 		event, err := reader.next()
 		if err != nil {
-			return err
+			return true, err
 		}
 		payload := bytes.TrimSpace(event.Data)
 		if event.Event != "message" || len(payload) == 0 {
 			continue
 		}
-		var msg struct {
-			Method string `json:"method"`
-			Params any    `json:"params"`
+		var msg streamEnvelope
+		if json.Unmarshal(payload, &msg) != nil || msg.Method == "" {
+			continue
 		}
-		if json.Unmarshal(payload, &msg) != nil {
+		if msg.hasID() {
+			// A server-to-client request (e.g. ping). Legacy servers may send
+			// these on the GET stream and the client must answer; the Modern
+			// era forbids them, so they are ignored there.
+			if legacy {
+				c.replyToServerRequest(ctx, msg.ID, msg.Method)
+			}
 			continue
 		}
 		if method, ok := translate(msg.Method); ok {
@@ -191,8 +301,9 @@ func (c *Client) applyAuthHeader(h http.Header) error {
 	return nil
 }
 
-// connectLegacySSE builds and sends one Legacy-era GET event-stream request.
-func (c *Client) connectLegacySSE(ctx context.Context) (*http.Response, func(string) (string, bool), error) {
+// connectLegacySSE builds and sends one Legacy-era GET event-stream request,
+// carrying Last-Event-ID when resuming after an earlier connection.
+func (c *Client) connectLegacySSE(ctx context.Context, lastEventID string) (*http.Response, func(string) (string, bool), error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL, nil)
 	if err != nil {
 		return nil, nil, err
@@ -201,7 +312,7 @@ func (c *Client) connectLegacySSE(ctx context.Context) (*http.Response, func(str
 	req.Header.Set("Accept", "text/event-stream")
 
 	c.mu.RLock()
-	sessionID := c.sessionID
+	sessionID := c.getSessionID()
 	protocolVersion := c.protocolVersion
 	c.mu.RUnlock()
 	if protocolVersion == "" {
@@ -210,6 +321,9 @@ func (c *Client) connectLegacySSE(ctx context.Context) (*http.Response, func(str
 	req.Header.Set(headerProtocolVersion, protocolVersion)
 	if sessionID != "" {
 		req.Header.Set(headerSessionID, sessionID)
+	}
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
 	}
 	if err := c.applyAuthHeader(req.Header); err != nil {
 		return nil, nil, err

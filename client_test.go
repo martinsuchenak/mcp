@@ -137,7 +137,7 @@ func TestClient_SSE_UnexpectedLines(t *testing.T) {
 		// include a comment and an empty data line before actual data
 		fmt.Fprintln(w, ": comment")
 		fmt.Fprintln(w, "data:")
-		fmt.Fprintf(w, "data: %s\n\n", `{"jsonrpc":"2.0","id":"list-tools","result":{"tools":[]}}`)
+		fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%v,\"result\":{\"tools\":[]}}\n\n", rpc.ID)
 	})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
@@ -223,7 +223,7 @@ func TestClient_EventStreamParsing(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprintf(w, "data: %s\n\n", `{"jsonrpc":"2.0","id":"list-tools","result":{"tools":[]}}`)
+		fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%v,\"result\":{\"tools\":[]}}\n\n", rpc.ID)
 	})
 	ts := httptest.NewServer(h)
 	defer ts.Close()

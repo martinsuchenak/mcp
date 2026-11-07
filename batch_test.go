@@ -53,12 +53,13 @@ func TestStdioCallToolsParallelOrderAndErrors(t *testing.T) {
 	}
 }
 
-// TestStdioCallToolsParallelIsSingleWireBatch proves CallToolsParallel over
-// stdio sends exactly one JSON-RPC message (a batch array), not one per call,
-// by counting top-level JSON values decoded from the wire.
-func TestStdioCallToolsParallelIsSingleWireBatch(t *testing.T) {
+// TestStdioCallToolsParallelSendsNoBatch proves CallToolsParallel over stdio
+// never sends a JSON-RPC batch to a server speaking a protocol revision
+// without batching (removed in 2025-06-18, absent from 2026-07-28; this
+// server negotiates Modern), but one individual request per call.
+func TestStdioCallToolsParallelSendsNoBatch(t *testing.T) {
 	server := buildStdioTestServer()
-	client, cleanup, messageCount := countingPipeStdioClient(t, server)
+	client, cleanup, counted := countingPipeStdioClient(t, server)
 	defer cleanup()
 
 	results := client.CallToolsParallel(context.Background(), []mcp.ToolCall{
@@ -71,11 +72,8 @@ func TestStdioCallToolsParallelIsSingleWireBatch(t *testing.T) {
 			t.Errorf("results[%d].Err = %v", i, r.Err)
 		}
 	}
-
-	// One message for "initialize" (sent lazily by CallTool/Initialize) plus
-	// one for the batch = 2, regardless of how many tools were called.
-	if got := messageCount.Load(); got != 2 {
-		t.Errorf("client->server wire messages = %d, want 2 (initialize + one batch)", got)
+	if got := counted.arrays.Load(); got != 0 {
+		t.Errorf("client sent %d JSON-RPC batch arrays, want 0", got)
 	}
 }
 
@@ -159,7 +157,7 @@ func TestStdioCallToolsParallelEmpty(t *testing.T) {
 // countingPipeStdioClient is like pipeStdioClient but counts the number of
 // top-level JSON messages the client writes to the server, to verify batching
 // actually reduces wire messages.
-func countingPipeStdioClient(t *testing.T, s *mcp.Server) (*mcp.Client, func(), *atomic.Int64) {
+func countingPipeStdioClient(t *testing.T, s *mcp.Server) (*mcp.Client, func(), *jsonMessageCountingWriter) {
 	t.Helper()
 	clientReader, serverWriter := io.Pipe()
 	serverReader, clientWriter := io.Pipe()
@@ -179,7 +177,7 @@ func countingPipeStdioClient(t *testing.T, s *mcp.Server) (*mcp.Client, func(), 
 		<-serveDone
 		serverWriter.Close()
 	}
-	return client, cleanup, &counted.count
+	return client, cleanup, counted
 }
 
 // jsonMessageCountingWriter counts each Write call as one JSON message. The
@@ -187,14 +185,18 @@ func countingPipeStdioClient(t *testing.T, s *mcp.Server) (*mcp.Client, func(), 
 // per Write call (each followed by its own newline), so counting writes is
 // equivalent to counting top-level wire messages.
 type jsonMessageCountingWriter struct {
-	mu    sync.Mutex
-	w     io.Writer
-	count atomic.Int64
+	mu     sync.Mutex
+	w      io.Writer
+	count  atomic.Int64
+	arrays atomic.Int64 // messages that are JSON-RPC batch arrays
 }
 
 func (c *jsonMessageCountingWriter) Write(p []byte) (int, error) {
 	if bytes.TrimSpace(p) != nil && json.Valid(bytes.TrimSpace(bytes.TrimRight(p, "\n"))) {
 		c.count.Add(1)
+		if bytes.HasPrefix(bytes.TrimSpace(p), []byte("[")) {
+			c.arrays.Add(1)
+		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
