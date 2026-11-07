@@ -23,8 +23,11 @@ A `Server` built with this library implements both simultaneously ("Dual-era"):
 each incoming request is routed to whichever era it actually speaks, based only
 on a real signal from that request (the `Mcp-Method` header on HTTP, or
 `io.modelcontextprotocol/protocolVersion` in `_meta` on any transport) — never on
-transport, URL, or configuration. A Legacy request never touches any Modern-era
-code path, and vice versa.
+transport, URL, or configuration. Any `_meta` protocolVersion claim that does not
+name a supported Legacy revision selects the Modern path, so an unknown or newer
+revision gets `UnsupportedProtocolVersionError` listing every supported version;
+a claim naming a Legacy revision is Legacy, and `initialize` is always Legacy.
+A Legacy request never touches any Modern-era code path, and vice versa.
 
 A `Client` detects which era its server speaks the first time `Initialize` runs:
 it attempts a Modern `server/discover` call first, and falls back to the Legacy
