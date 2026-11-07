@@ -3,7 +3,7 @@ package mcp
 import "sync"
 
 // MCP notification method names for list-change signalling, as every
-// protocol revision (2024-11-05 through 2026-07-28) spells them.
+// protocol revision (2025-03-26 through 2026-07-28) spells them.
 const (
 	NotificationToolsChanged     = "notifications/tools/list_changed"
 	NotificationResourcesChanged = "notifications/resources/list_changed"

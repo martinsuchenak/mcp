@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/paularlott/jsonrpc"
 )
 
 // --- Modern detection against a real Dual-era *Server ---------------------
@@ -178,9 +176,7 @@ func TestClient_ModernDetectionStdio(t *testing.T) {
 		_ = s.ServeStream(context.Background(), serverReader, serverWriter)
 	}()
 
-	transport := jsonrpc.NewStreamTransport(clientReader, clientWriter)
-	rpc := jsonrpc.NewClient(transport)
-	client := newStreamClient(rpc, "")
+	client := NewStreamClient(clientReader, clientWriter, "")
 	defer func() {
 		client.Close()
 		clientWriter.Close()

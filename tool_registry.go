@@ -343,49 +343,41 @@ func containsWord(text, query string) bool {
 	return false
 }
 
-// validateRequiredParameters checks if all required parameters are present and non-empty
+// validateRequiredParameters checks a call's arguments against the tool's
+// whole inputSchema (validateJSONSchema): required properties, every
+// property's type and constraints, nested objects and arrays, enums and
+// additionalProperties. A violation is a malformed request (-32602) that
+// never reaches the handler, as the tools spec's "validate all tool
+// inputs" asks; the error names the offending argument.
 func validateRequiredParameters(inputSchema any, args map[string]any) error {
-	schema, ok := inputSchema.(map[string]any)
-	if !ok {
+	if _, ok := inputSchema.(map[string]any); !ok {
 		return nil
 	}
-
-	requiredRaw, ok := schema["required"]
-	if !ok {
-		return nil
+	value := map[string]any{}
+	for k, v := range args {
+		value[k] = v
 	}
-
-	// Handle both []any and []string
-	var required []string
-	switch v := requiredRaw.(type) {
-	case []any:
-		for _, req := range v {
-			if paramName, ok := req.(string); ok {
-				required = append(required, paramName)
-			}
+	if err := validateJSONSchema(inputSchema, value); err != nil {
+		msg := err.Error()
+		if se, ok := err.(schemaError); ok && se.path == "" {
+			msg = "arguments " + se.msg
+		} else if ok {
+			msg = "parameter " + se.path + " " + se.msg
 		}
-	case []string:
-		required = v
-	default:
-		return nil
+		return NewToolError(ErrorCodeInvalidParams, msg, map[string]any{"parameter": pathParameter(err)})
 	}
-
-	for _, paramName := range required {
-		val, exists := args[paramName]
-		if !exists {
-			return NewToolError(ErrorCodeInvalidParams, "missing required parameter: "+paramName, nil)
-		}
-
-		// Check for empty string
-		if strVal, ok := val.(string); ok && strVal == "" {
-			return NewToolError(ErrorCodeInvalidParams, "required parameter cannot be empty: "+paramName, nil)
-		}
-
-		// Check for nil
-		if val == nil {
-			return NewToolError(ErrorCodeInvalidParams, "required parameter cannot be null: "+paramName, nil)
-		}
-	}
-
 	return nil
+}
+
+// pathParameter is the top-level argument name a schema error refers to.
+func pathParameter(err error) string {
+	se, ok := err.(schemaError)
+	if !ok || se.path == "" {
+		return ""
+	}
+	name := se.path
+	if i := strings.IndexAny(name, ".["); i > 0 {
+		name = name[:i]
+	}
+	return name
 }

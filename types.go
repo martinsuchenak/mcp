@@ -54,10 +54,9 @@ type initializeResult struct {
 
 type capabilities struct {
 	Tools map[string]any `json:"tools"`
-	// Resources and Prompts are always advertised (an empty object for
-	// 2024-11-05): the lifecycle spec lets a client use only the
-	// capabilities it was told about, so omitting them would hide
-	// resources/* and prompts/* from a compliant client.
+	// Resources and Prompts are always advertised: the lifecycle spec lets
+	// a client use only the capabilities it was told about, so omitting
+	// them would hide resources/* and prompts/* from a compliant client.
 	Resources  map[string]any `json:"resources"`
 	Prompts    map[string]any `json:"prompts"`
 	Extensions map[string]any `json:"extensions,omitempty"`

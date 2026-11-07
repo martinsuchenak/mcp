@@ -1134,13 +1134,10 @@ func TestModernRequest_InvalidJSONRPCVersion_Returns400(t *testing.T) {
 	}
 }
 
-// TestModernRequest_LegacyGarbledBody_Unaffected is the regression guard for
-// the two tests above: a Legacy request (no Mcp-Method header) with the
-// exact same garbled bodies must keep getting 200, per the Legacy always-200
-// JSON-RPC convention (TestHandleRequestEdgeCases already covers the plain
-// decode-failure case without any Modern signal at all; this specifically
-// confirms adding era-awareness to that shared code path didn't flip Legacy
-// too).
+// TestModernRequest_LegacyGarbledBody_Unaffected: a Legacy request with a
+// body that is not a JSON-RPC message gets the same 400 with a JSON-RPC
+// error envelope in both eras (parse error / invalid request are input the
+// transport cannot accept), independent of any Modern signal.
 func TestModernRequest_LegacyGarbledBody_Unaffected(t *testing.T) {
 	s := NewServer("garbled", "1")
 	ts := httptest.NewServer(http.HandlerFunc(s.HandleRequest))
@@ -1154,8 +1151,8 @@ func TestModernRequest_LegacyGarbledBody_Unaffected(t *testing.T) {
 			t.Fatalf("Do: %v", err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("body %q: status = %d, want 200 (Legacy convention unchanged)", body, resp.StatusCode)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body %q: status = %d, want 400 (not a JSON-RPC message)", body, resp.StatusCode)
 		}
 	}
 }
@@ -1481,6 +1478,12 @@ func TestSubscriptionsListen_GracefulShutdown(t *testing.T) {
 	waitForSubscribers(t, s, 1)
 	s.Shutdown()
 
+	// The teardown is announced with notifications/cancelled naming the
+	// listen request (cancellation pattern), then closed with its result.
+	cancelled := reader.next(t)
+	if !strings.Contains(cancelled, `"method":"notifications/cancelled"`) || !strings.Contains(cancelled, `"requestId":1`) {
+		t.Fatalf("expected notifications/cancelled first, got: %s", cancelled)
+	}
 	closure := reader.next(t)
 	payload := strings.TrimSpace(strings.TrimPrefix(closure, "data:"))
 	var out map[string]any
@@ -1511,27 +1514,35 @@ func TestSubscriptionsListen_GracefulShutdown(t *testing.T) {
 // tolerating heartbeat comment lines.
 type sseLineReader struct {
 	r   io.Reader
-	buf []byte
+	buf string
 }
 
 func newSSELineReader(r io.Reader) *sseLineReader { return &sseLineReader{r: r} }
 
+// next returns the next "data: ..." event, buffering what one read may
+// deliver beyond it (several events can arrive in one chunk).
 func (s *sseLineReader) next(t *testing.T) string {
 	t.Helper()
 	chunk := make([]byte, 4096)
 	for i := 0; i < 20; i++ {
-		n, err := s.r.Read(chunk)
-		// Per io.Reader's contract, a call may legitimately return n > 0
-		// alongside a non-nil error (e.g. the final chunk together with
-		// io.EOF, as happens right after the server writes its last message
-		// and returns, closing the connection) — that data must still be
-		// processed before treating the error as a failure.
-		if n > 0 {
-			text := string(chunk[:n])
-			if strings.HasPrefix(text, "data: ") {
-				return text
+		for {
+			idx := strings.Index(s.buf, "\n\n")
+			if idx < 0 {
+				break
 			}
-			// heartbeat/comment line ("\n" prefix) — keep reading
+			event := s.buf[:idx+2]
+			s.buf = s.buf[idx+2:]
+			if strings.HasPrefix(event, "data: ") {
+				return event
+			}
+			// heartbeat/comment event — keep looking
+		}
+		n, err := s.r.Read(chunk)
+		// Per io.Reader's contract, a call may return n > 0 alongside an
+		// error (the final chunk with io.EOF); that data is still processed.
+		if n > 0 {
+			s.buf += string(chunk[:n])
+			continue
 		}
 		if err != nil {
 			t.Fatalf("read SSE: %v", err)

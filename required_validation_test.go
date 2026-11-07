@@ -33,10 +33,10 @@ func TestRequiredParameterValidation(t *testing.T) {
 		t.Errorf("Expected error code %d, got %d", ErrorCodeInvalidParams, toolErr.Code)
 	}
 
-	// Test with empty string
-	_, err = server.CallTool(context.Background(), "test", map[string]any{"name": ""})
-	if err == nil {
-		t.Fatal("Expected error for empty required parameter, got nil")
+	// An empty string is a present value: JSON Schema's required means
+	// present, not non-empty, so it is accepted.
+	if _, err = server.CallTool(context.Background(), "test", map[string]any{"name": ""}); err != nil {
+		t.Fatalf("empty string for a required parameter must be accepted, got %v", err)
 	}
 
 	// Test with valid parameter

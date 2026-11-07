@@ -93,6 +93,10 @@ func (s *Server) GetPrompt(ctx context.Context, name string, args map[string]str
 
 // handlePromptsList handles prompts/list over HTTP.
 func (s *Server) handlePromptsList(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
+	if cursorIn(req.Params) {
+		s.sendMCPError(w, req.ID, errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		return
+	}
 	prompts := s.ListPrompts(r.Context())
 	s.sendMCPResponse(w, req.ID, map[string]any{"prompts": prompts})
 }

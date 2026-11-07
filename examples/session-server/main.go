@@ -43,6 +43,6 @@ func main() {
 	fmt.Println("- JWT-based sessions (stateless, scalable)")
 	fmt.Println("- No external dependencies required")
 	fmt.Println("- Sessions expire after 30 minutes")
-	fmt.Println("- Supports protocol versions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25")
+	fmt.Println("- Supports protocol versions: 2025-03-26, 2025-06-18, 2025-11-25")
 	log.Fatal(http.ListenAndServe(":8000", nil))
 }

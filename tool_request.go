@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 )
 
@@ -56,9 +57,15 @@ func (r *ToolRequest) Int(name string) (int, error) {
 		return v, nil
 	case float64:
 		return int(v), nil
-	default:
-		return 0, fmt.Errorf("parameter '%s' is not a number", name)
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return int(i), nil
+		}
+		if f, err := v.Float64(); err == nil {
+			return int(f), nil
+		}
 	}
+	return 0, fmt.Errorf("parameter '%s' is not a number", name)
 }
 
 // IntOr returns an integer parameter or defaultValue if not present or invalid.

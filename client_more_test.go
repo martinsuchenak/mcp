@@ -186,7 +186,7 @@ func TestClient_ProtocolVersion_Legacy(t *testing.T) {
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Result: map[string]any{
-				"protocolVersion": "2024-11-05",
+				"protocolVersion": "2025-03-26",
 				"capabilities":    map[string]any{},
 				"serverInfo":      map[string]any{"name": "old-server", "version": "0.1"},
 			},
@@ -201,8 +201,8 @@ func TestClient_ProtocolVersion_Legacy(t *testing.T) {
 	if err := c.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	if got := c.ProtocolVersion(); got != "2024-11-05" {
-		t.Fatalf("ProtocolVersion() = %q, want %q", got, "2024-11-05")
+	if got := c.ProtocolVersion(); got != "2025-03-26" {
+		t.Fatalf("ProtocolVersion() = %q, want %q", got, "2025-03-26")
 	}
 }
 

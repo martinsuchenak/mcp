@@ -395,12 +395,20 @@ func (s *Server) ReadResourceFrom(ctx context.Context, source, uri string) (*Res
 
 // handleResourcesList handles resources/list over HTTP.
 func (s *Server) handleResourcesList(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
+	if cursorIn(req.Params) {
+		s.sendMCPError(w, req.ID, errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		return
+	}
 	resources := s.ListResources(r.Context())
 	s.sendMCPResponse(w, req.ID, map[string]any{"resources": resources})
 }
 
 // handleResourcesTemplatesList handles resources/templates/list over HTTP.
 func (s *Server) handleResourcesTemplatesList(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
+	if cursorIn(req.Params) {
+		s.sendMCPError(w, req.ID, errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		return
+	}
 	templates := s.ListResourceTemplates(r.Context())
 	s.sendMCPResponse(w, req.ID, map[string]any{"resourceTemplates": templates})
 }

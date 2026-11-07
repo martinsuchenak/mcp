@@ -352,11 +352,6 @@ func TestCapabilitiesAdvertiseListChangedTrue(t *testing.T) {
 	if caps.Prompts["listChanged"] != true {
 		t.Fatalf("prompts.listChanged should be true, got %v", caps.Prompts["listChanged"])
 	}
-	// Older protocol version does not advertise listChanged.
-	old := s.buildCapabilities("2024-11-05")
-	if _, ok := old.Tools["listChanged"]; ok {
-		t.Fatalf("2024-11-05 should not advertise tools.listChanged, got %v", old.Tools)
-	}
 }
 
 // TestEmitNoOpWithoutSubscribers: emitting with no subscribers must be cheap

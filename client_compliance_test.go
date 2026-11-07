@@ -757,3 +757,69 @@ func TestStdioClient_ModernSubscribesForListChanged(t *testing.T) {
 		return ok && fmt.Sprint(cancelled.Params["requestId"]) == string(listen.ID)
 	})
 }
+
+// A 404 on the Legacy GET notification stream re-initializes the session
+// and reconnects with the new session id.
+func TestClient_EventStream404Reinitializes(t *testing.T) {
+	var mu sync.Mutex
+	sessions := 0
+	gets := []string{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			var req MCPRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Method == "initialize" {
+				mu.Lock()
+				sessions++
+				sid := fmt.Sprintf("sess-%d", sessions)
+				mu.Unlock()
+				w.Header().Set(headerSessionID, sid)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(MCPResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+					"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "serverInfo": map[string]any{"name": "s", "version": "1"},
+				}})
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case http.MethodGet:
+			sid := r.Header.Get(headerSessionID)
+			mu.Lock()
+			gets = append(gets, sid)
+			mu.Unlock()
+			if sid == "sess-1" {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, nil, "")
+	c.EnableNotifications()
+	if err := c.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		done := len(gets) >= 2 && gets[len(gets)-1] == "sess-2"
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if sessions != 2 || len(gets) < 2 || gets[0] != "sess-1" || gets[len(gets)-1] != "sess-2" {
+		t.Fatalf("sessions=%d gets=%v, want a re-initialize and a reconnect with sess-2", sessions, gets)
+	}
+}

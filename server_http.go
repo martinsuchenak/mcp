@@ -117,8 +117,13 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	raw, err := io.ReadAll(r.Body)
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxRequestBytes()))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		s.sendProtocolAwareError(w, r, &MCPRequest{}, nil, ErrorCodeParseError, "Parse error", map[string]any{
 			"details": err.Error(),
 		})
@@ -126,8 +131,8 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	raw = bytes.TrimSpace(raw)
 
-	// A JSON array is a JSON-RPC batch: required of a 2025-03-26 (and
-	// 2024-11-05) server, withdrawn by 2025-06-18 and later revisions.
+	// A JSON array is a JSON-RPC batch: required of a 2025-03-26 server,
+	// withdrawn by 2025-06-18 and later revisions.
 	if len(raw) > 0 && raw[0] == '[' {
 		s.handleLegacyBatch(w, r, raw)
 		return
@@ -152,10 +157,15 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	// 400/404 for those, whatever the message, and a client must learn its
 	// session is gone from the first message it sends, not the first request.
 	if (req.ID == nil && req.Method != "") || (req.ID != nil && req.Method == "") {
-		if !isModernRequest(r, &req) {
-			if _, ok := s.legacyPreflight(w, r, nil); !ok {
+		if isModernRequest(r, &req) {
+			if !s.modernMessagePreflight(w, r, &req) {
 				return
 			}
+		} else if _, ok := s.legacyPreflight(w, r, nil); !ok {
+			return
+		}
+		if req.Method == "notifications/cancelled" {
+			s.cancelHTTPRequest(r, req.Params)
 		}
 		w.WriteHeader(http.StatusAccepted)
 		return
@@ -179,14 +189,17 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	r, release := s.trackHTTPRequest(r, &req)
+	defer release()
 	s.dispatchResponse(w, r, &req, legacyShape)
 }
 
 // decodeMCPRequest parses one JSON-RPC message, keeping integer ids exact
 // (a float64 would round ids above 2^53) and enforcing the base protocol's
 // id rules: an id, when present, is a string or an integer and never null.
-// The returned error is the JSON-RPC error to answer with; req.ID is set
-// when it could be read.
+// Params are decoded as ordinary JSON values (numbers as float64), which is
+// what tool handlers and ToolRequest expect. The returned error is the
+// JSON-RPC error to answer with; req.ID is set when it could be read.
 func decodeMCPRequest(raw []byte, req *MCPRequest) *MCPError {
 	var wire struct {
 		JSONRPC string          `json:"jsonrpc"`
@@ -194,10 +207,18 @@ func decodeMCPRequest(raw []byte, req *MCPRequest) *MCPError {
 		Method  string          `json:"method"`
 		Params  any             `json:"params"`
 	}
+	if !json.Valid(raw) {
+		return &MCPError{Code: ErrorCodeParseError, Message: "Parse error", Data: map[string]any{"details": "body is not valid JSON"}}
+	}
+	if len(raw) == 0 || raw[0] != '{' {
+		return &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request", Data: map[string]any{"details": "a JSON-RPC message is a JSON object"}}
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
 	if err := dec.Decode(&wire); err != nil {
-		return &MCPError{Code: ErrorCodeParseError, Message: "Parse error", Data: map[string]any{"details": err.Error()}}
+		return &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request", Data: map[string]any{"details": "malformed JSON-RPC message"}}
+	}
+	if dec.More() {
+		return &MCPError{Code: ErrorCodeParseError, Message: "Parse error", Data: map[string]any{"details": "unexpected data after the JSON-RPC message"}}
 	}
 	req.JSONRPC, req.Method, req.Params = wire.JSONRPC, wire.Method, wire.Params
 	if len(wire.ID) > 0 {
@@ -283,7 +304,7 @@ func (s *Server) legacyPreflight(w http.ResponseWriter, r *http.Request, id any)
 
 // batchProtocolVersions are the Legacy revisions whose Streamable HTTP
 // transport lets a client POST a JSON-RPC batch; 2025-06-18 removed it.
-var batchProtocolVersions = map[string]bool{"2024-11-05": true, "2025-03-26": true}
+var batchProtocolVersions = map[string]bool{"2025-03-26": true}
 
 // handleLegacyBatch serves a JSON-RPC batch (a JSON array) for the revisions
 // that allow one: each request is dispatched in turn and the responses are
@@ -317,6 +338,12 @@ func (s *Server) handleLegacyBatch(w http.ResponseWriter, r *http.Request, raw [
 		var req MCPRequest
 		if perr := decodeMCPRequest(bytes.TrimSpace(item), &req); perr != nil {
 			body, _ := json.Marshal(MCPResponse{JSONRPC: "2.0", ID: req.ID, Error: perr})
+			responses = append(responses, body)
+			continue
+		}
+		if isModernRequest(nil, &req) {
+			body, _ := json.Marshal(MCPResponse{JSONRPC: "2.0", ID: req.ID, Error: &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request",
+				Data: map[string]any{"details": "a 2026-07-28 request cannot be sent in a batch"}}})
 			responses = append(responses, body)
 			continue
 		}
@@ -552,27 +579,18 @@ func (s *Server) buildCapabilities(protocolVersion string) capabilities {
 		Tools: map[string]any{},
 	}
 
-	// Add version-specific capabilities
-	switch protocolVersion {
-	case "2024-11-05":
-		// Basic capabilities for 2024-11-05
-		caps.Tools = map[string]any{}
-		caps.Resources = map[string]any{}
-		caps.Prompts = map[string]any{}
-	default: // 2025-03-26, 2025-06-18 and use latest if unknown
-		// Default to latest
-		caps.Tools = map[string]any{
-			"listChanged": true,
-		}
-		caps.Resources = map[string]any{
-			"subscribe":   false,
-			"listChanged": true,
-		}
-		caps.Prompts = map[string]any{
-			"listChanged": true,
-		}
+	// Every supported Legacy revision (2025-03-26 and later) has the same
+	// capability shape.
+	caps.Tools = map[string]any{
+		"listChanged": true,
 	}
-
+	caps.Resources = map[string]any{
+		"subscribe":   false,
+		"listChanged": true,
+	}
+	caps.Prompts = map[string]any{
+		"listChanged": true,
+	}
 	s.mu.RLock()
 	if len(s.extensionCapabilities) > 0 {
 		caps.Extensions = make(map[string]any, len(s.extensionCapabilities))
@@ -629,6 +647,10 @@ func (s *Server) ClientCapabilities() map[string]any {
 }
 
 func (s *Server) handleToolsList(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
+	if cursorIn(req.Params) {
+		s.sendMCPError(w, req.ID, errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		return
+	}
 	tools := s.ListToolsWithContext(r.Context())
 	result := map[string]any{
 		"tools": tools,
@@ -728,6 +750,14 @@ func (s *Server) sendProtocolAwareError(w http.ResponseWriter, r *http.Request, 
 		s.writeModernProtocolError(w, id, http.StatusBadRequest, code, message, data)
 		return
 	}
+	// A body that is not a JSON-RPC message at all (parse error, invalid
+	// request) is input the server cannot accept: the Streamable HTTP
+	// transport has that answered with an HTTP error status, as the
+	// official SDKs do, rather than the 200 that carries a method's result.
+	if code == ErrorCodeParseError || code == ErrorCodeInvalidRequest {
+		s.writeModernProtocolError(w, id, http.StatusBadRequest, code, message, data)
+		return
+	}
 	s.sendMCPError(w, id, code, message, data)
 }
 
@@ -758,6 +788,10 @@ func (s *Server) writeMCPError(w http.ResponseWriter, status int, id any, code i
 // handleSkillsList answers skills/list with the registered skills plus any
 // from SkillProviders on the request context.
 func (s *Server) handleSkillsList(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
+	if cursorIn(req.Params) {
+		s.sendMCPError(w, req.ID, errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		return
+	}
 	s.sendMCPResponse(w, req.ID, map[string]any{"skills": s.ListSkillsWithContext(r.Context())})
 }
 
@@ -782,4 +816,107 @@ func (s *Server) handleSkillsGet(w http.ResponseWriter, r *http.Request, req *MC
 		return
 	}
 	s.sendMCPResponse(w, req.ID, map[string]any{"skill": skill})
+}
+
+// modernMessagePreflight applies the 2026-07-28 header rules to a Modern
+// notification (every POST must carry MCP-Protocol-Version matching the
+// _meta claim, and Mcp-Method matching the method) before it is accepted;
+// a failure is answered 400 the way handleModernRequest answers a request.
+func (s *Server) modernMessagePreflight(w http.ResponseWriter, r *http.Request, req *MCPRequest) bool {
+	_, meta := modernRequestParams(req)
+	claim, _ := meta[metaKeyProtocolVersion].(string)
+	headerVersion := r.Header.Get(headerProtocolVersion)
+	if len(r.Header.Values(headerProtocolVersion)) > 1 || len(r.Header.Values(headerMcpMethod)) > 1 {
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeHeaderMismatch, "Header mismatch: multiple header values", nil)
+		return false
+	}
+	switch {
+	case headerVersion == "":
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeHeaderMismatch, "Header mismatch: MCP-Protocol-Version header is required", nil)
+	case headerVersion != claim:
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeHeaderMismatch,
+			fmt.Sprintf("Header mismatch: MCP-Protocol-Version header value %q does not match body value %q", headerVersion, claim), nil)
+	case !isSupportedModernProtocolVersion(claim):
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeUnsupportedProtocolVersion, "Unsupported protocol version",
+			map[string]any{"supported": allSupportedProtocolVersions(), "requested": claim})
+	case req.Method != "" && r.Header.Get(headerMcpMethod) == "":
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeHeaderMismatch, "Header mismatch: Mcp-Method header is required", nil)
+	case req.Method != "" && r.Header.Get(headerMcpMethod) != req.Method:
+		s.writeModernProtocolError(w, nil, http.StatusBadRequest, ErrorCodeHeaderMismatch,
+			fmt.Sprintf("Header mismatch: Mcp-Method header value %q does not match body method %q", r.Header.Get(headerMcpMethod), req.Method), nil)
+	default:
+		return true
+	}
+	return false
+}
+
+// DefaultMaxRequestBytes bounds a POST body (and a stdio line) when
+// SetMaxRequestBytes has not been called.
+const DefaultMaxRequestBytes = 32 << 20
+
+// SetMaxRequestBytes bounds the size of one inbound JSON-RPC message over
+// HTTP (413 beyond it) and stdio; 0 restores DefaultMaxRequestBytes.
+func (s *Server) SetMaxRequestBytes(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxRequest = n
+}
+
+func (s *Server) maxRequestBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.maxRequest <= 0 {
+		return DefaultMaxRequestBytes
+	}
+	return s.maxRequest
+}
+
+// httpInflightKey identifies an in-flight Legacy HTTP request for
+// notifications/cancelled: its JSON-RPC id, scoped to the session when
+// there is one (anonymous requests share a scope).
+func httpInflightKey(r *http.Request, id any) string {
+	raw, _ := json.Marshal(id)
+	return r.Header.Get(headerSessionID) + "|" + string(raw)
+}
+
+// trackHTTPRequest derives a cancellable context for a Legacy request so a
+// later notifications/cancelled naming its id can stop the handler
+// (2025-11-25 utilities/cancellation). The returned release must be called
+// when the request completes.
+func (s *Server) trackHTTPRequest(r *http.Request, req *MCPRequest) (*http.Request, func()) {
+	ctx, cancel := context.WithCancel(r.Context())
+	key := httpInflightKey(r, req.ID)
+	s.mu.Lock()
+	if s.httpInflight == nil {
+		s.httpInflight = map[string]context.CancelFunc{}
+	}
+	s.httpInflight[key] = cancel
+	s.mu.Unlock()
+	return r.WithContext(ctx), func() {
+		s.mu.Lock()
+		delete(s.httpInflight, key)
+		s.mu.Unlock()
+		cancel()
+	}
+}
+
+// cancelHTTPRequest acts on a notifications/cancelled: the named request's
+// context is cancelled; its handler decides what that means (a tool that
+// honours its context stops and its result reports the cancellation).
+func (s *Server) cancelHTTPRequest(r *http.Request, params any) {
+	p, _ := params.(map[string]any)
+	id, ok := p["requestId"]
+	if !ok {
+		return
+	}
+	if n, isNum := id.(float64); isNum && n == float64(int64(n)) {
+		id = json.Number(fmt.Sprintf("%d", int64(n)))
+	}
+	key := httpInflightKey(r, id)
+	s.mu.RLock()
+	cancel := s.httpInflight[key]
+	s.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
 }

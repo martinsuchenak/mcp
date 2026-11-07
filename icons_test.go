@@ -18,7 +18,7 @@ var testIcon = Icon{Src: "https://example.com/icon.png", MimeType: "image/png", 
 
 // TestIcons_DoNotBreakOlderLegacyProtocolVersions is a direct backward-
 // compatibility check: Icons is new, additive metadata, but every prior
-// Legacy protocol version (2024-11-05 through 2025-06-18) must keep working
+// Legacy protocol version (2025-03-26 through 2025-06-18) must keep working
 // exactly as before even when a tool has icons set — old clients that don't
 // recognize the field are expected to ignore it (ordinary JSON forward
 // compatibility), not choke on it, and the negotiated capabilities shape for
@@ -32,7 +32,7 @@ func TestIcons_DoNotBreakOlderLegacyProtocolVersions(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(s.HandleRequest))
 	defer ts.Close()
 
-	for _, version := range []string{"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"} {
+	for _, version := range []string{"2025-03-26", "2025-06-18", "2025-11-25"} {
 		t.Run(version, func(t *testing.T) {
 			initBody, _ := json.Marshal(map[string]any{
 				"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -65,14 +65,11 @@ func TestIcons_DoNotBreakOlderLegacyProtocolVersions(t *testing.T) {
 			if !ok {
 				t.Fatalf("no capabilities: %s", raw)
 			}
-			// The 2025-03-26+ vs 2024-11-05 capability shape difference is a
-			// pre-existing, version-gated distinction unrelated to icons —
-			// confirm it's still exactly what it was before icons existed.
+			// The capability shape is unrelated to icons — confirm it is
+			// still exactly what it was before icons existed.
 			toolsCaps, _ := caps["tools"].(map[string]any)
-			_, hasListChanged := toolsCaps["listChanged"]
-			wantListChanged := version != "2024-11-05"
-			if hasListChanged != wantListChanged {
-				t.Errorf("tools.listChanged present = %v, want %v for %s (unrelated to icons — must not regress)", hasListChanged, wantListChanged, version)
+			if _, hasListChanged := toolsCaps["listChanged"]; !hasListChanged {
+				t.Errorf("tools.listChanged missing for %s (unrelated to icons — must not regress)", version)
 			}
 			serverInfo, _ := result["serverInfo"].(map[string]any)
 			icons, _ := serverInfo["icons"].([]any)

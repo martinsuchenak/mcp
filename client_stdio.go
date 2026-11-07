@@ -20,8 +20,6 @@ import (
 // (jsonrpc.Peer implements jsonrpc.Transport), so the client knows each
 // request's wire id: it needs it to send notifications/cancelled for an
 // abandoned request and to correlate a subscriptions/listen subscription.
-// Without a peer (newStreamClient over a bare jsonrpc.Client) the
-// jsonrpc.Client assigns ids itself and neither is possible.
 type stdioTransport struct {
 	rpc  *jsonrpc.Client
 	peer *jsonrpc.Peer
@@ -318,25 +316,9 @@ func NewStreamClient(in io.Reader, out io.Writer, namespace string) *Client {
 	return c
 }
 
-// newStreamClient builds a Client from an already-connected jsonrpc.Client. It
-// is retained for callers that have a Client/transport already and do not need
-// inbound notification handling.
-
 // newPeerClient wires a bidirectional jsonrpc.Peer into a Client: outbound calls
-// go through the Peer's Client (unchanged stdioTransport), and inbound
-// listChanged notifications are dispatched to the Client's notification handler.
-// newStreamClient builds a Client over an existing jsonrpc stream (used by
-// NewStreamClient and the stdio tests).
-func newStreamClient(rpc *jsonrpc.Client, namespace string) *Client {
-	separator := DefaultNamespaceSeparator
-	namespace = normalizeNamespace(namespace)
-	return &Client{
-		namespace: namespace,
-		separator: separator,
-		transport: &stdioTransport{rpc: rpc},
-	}
-}
-
+// go through the Peer (with the client's own request ids), and inbound
+// notifications and server requests are dispatched by the Peer's handlers.
 func newPeerClient(peer *jsonrpc.Peer, namespace string) *Client {
 	separator := DefaultNamespaceSeparator
 	namespace = normalizeNamespace(namespace)

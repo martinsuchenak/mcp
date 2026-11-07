@@ -13,7 +13,7 @@ import (
 
 const (
 	MCPProtocolVersionLatest = "2025-11-25"
-	MCPProtocolVersionMin    = "2024-11-05"
+	MCPProtocolVersionMin    = "2025-03-26"
 
 	// DefaultSessionTTL is the default session lifetime for JWT session management
 	DefaultSessionTTL = 30 * time.Minute
@@ -36,7 +36,6 @@ const (
 // For non-initialize requests, the MCP-Protocol-Version header is validated
 // against this list.
 var supportedProtocolVersions = []string{
-	"2024-11-05",
 	"2025-03-26",
 	"2025-06-18",
 	"2025-11-25",
@@ -120,6 +119,8 @@ type Server struct {
 	extensionCapabilities  map[string]any                 // This server's declared extensions.<id> settings
 	lastClientCapabilities map[string]any                 // Most recently negotiated client capabilities (see ClientCapabilities)
 	shutdownCh             chan struct{}                  // Closed by Shutdown; see modern.go's subscriptions/listen graceful closure
+	maxRequest             int64                          // SetMaxRequestBytes; 0 = DefaultMaxRequestBytes
+	httpInflight           map[string]context.CancelFunc  // Legacy HTTP requests that notifications/cancelled can reach
 	shutdownOnce           sync.Once
 	originValidator        OriginValidator               // nil = defaultOriginValidator; see origin.go
 	skills                 map[string]*skillRegistration // Registered skills (SEP-2640), keyed by name
@@ -496,7 +497,8 @@ func (s *Server) CallTool(ctx context.Context, name string, args map[string]any)
 // An unknown tool is a protocol error with the spec's own example code
 // (-32602, "Unknown tool: ..."); see toolsCallResult for everything else.
 func (s *Server) toolsCallWireError(ctx context.Context, name string, err error) *MCPError {
-	if toolErr, ok := err.(*ToolError); ok {
+	var toolErr *ToolError
+	if errors.As(err, &toolErr) && !isModernProtocolErrorCode(toolErr.Code) {
 		return &MCPError{Code: toolErr.Code, Message: toolErr.Message, Data: toolErr.Data}
 	}
 	if errors.Is(err, ErrUnknownTool) {
@@ -554,7 +556,8 @@ func resourcesReadWireError(uri string, err error, legacy bool) *MCPError {
 		}
 		return &MCPError{Code: code, Message: "Resource not found", Data: data}
 	}
-	if toolErr, ok := err.(*ToolError); ok {
+	var toolErr *ToolError
+	if errors.As(err, &toolErr) {
 		return &MCPError{Code: toolErr.Code, Message: toolErr.Message, Data: toolErr.Data}
 	}
 	return &MCPError{Code: ErrorCodeInternalError, Message: fmt.Sprintf("Resource read failed: %v", err)}
@@ -566,7 +569,8 @@ func promptsGetWireError(name string, err error) *MCPError {
 	if err == ErrUnknownPrompt {
 		return &MCPError{Code: ErrorCodeInvalidParams, Message: "Prompt not found", Data: map[string]any{"name": name}}
 	}
-	if toolErr, ok := err.(*ToolError); ok {
+	var toolErr *ToolError
+	if errors.As(err, &toolErr) {
 		return &MCPError{Code: toolErr.Code, Message: toolErr.Message, Data: toolErr.Data}
 	}
 	return &MCPError{Code: ErrorCodeInternalError, Message: fmt.Sprintf("Prompt render failed: %v", err)}
@@ -574,11 +578,11 @@ func promptsGetWireError(name string, err error) *MCPError {
 
 // checkStructuredOutput enforces the tools spec's rule that a tool with an
 // outputSchema "MUST provide structured results that conform to this
-// schema": a successful response with no structuredContent, or one missing
-// a required property or carrying the wrong primitive type for one, is
-// turned into a tool execution error naming the defect, so the problem
-// surfaces to the model and the developer instead of an invalid result
-// going out on the wire. An isError response is left alone.
+// schema": a successful response with no structuredContent, or one that
+// does not validate against the whole schema, is turned into a tool
+// execution error naming the defect, so the problem surfaces to the model
+// and the developer instead of an invalid result going out on the wire. An
+// isError response is left alone.
 func checkStructuredOutput(outputSchema any, resp *ToolResponse) *ToolResponse {
 	if resp == nil || resp.IsError {
 		return resp
@@ -586,43 +590,19 @@ func checkStructuredOutput(outputSchema any, resp *ToolResponse) *ToolResponse {
 	if resp.StructuredContent == nil {
 		return NewToolResponseError("tool declares an outputSchema but returned no structuredContent")
 	}
-	schema, _ := outputSchema.(map[string]any)
-	if schema == nil {
+	if _, ok := outputSchema.(map[string]any); !ok {
 		return resp
 	}
 	raw, err := json.Marshal(resp.StructuredContent)
 	if err != nil {
 		return NewToolResponseError("structuredContent cannot be encoded: " + err.Error())
 	}
-	var obj map[string]any
-	if json.Unmarshal(raw, &obj) != nil {
-		return resp // not an object: nothing the property checks apply to
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return NewToolResponseError("structuredContent cannot be decoded: " + err.Error())
 	}
-	var required []string
-	switch r := schema["required"].(type) {
-	case []string:
-		required = r
-	case []any:
-		for _, v := range r {
-			if name, ok := v.(string); ok {
-				required = append(required, name)
-			}
-		}
-	}
-	for _, name := range required {
-		if _, present := obj[name]; !present {
-			return NewToolResponseError("structuredContent does not conform to outputSchema: missing required property " + name)
-		}
-	}
-	if props, ok := schema["properties"].(map[string]any); ok {
-		for name, v := range obj {
-			prop, _ := props[name].(map[string]any)
-			want, _ := prop["type"].(string)
-			if want == "" || v == nil || jsonValueMatchesType(v, want) {
-				continue
-			}
-			return NewToolResponseError(fmt.Sprintf("structuredContent does not conform to outputSchema: property %s is not of type %s", name, want))
-		}
+	if err := validateJSONSchema(outputSchema, value); err != nil {
+		return NewToolResponseError("structuredContent does not conform to outputSchema: " + err.Error())
 	}
 	return resp
 }
@@ -635,11 +615,13 @@ func jsonValueMatchesType(v any, want string) bool {
 		_, ok := v.(string)
 		return ok
 	case "number":
-		_, ok := v.(float64)
+		_, ok := jsonNumberValue(v)
 		return ok
 	case "integer":
-		f, ok := v.(float64)
+		f, ok := jsonNumberValue(v)
 		return ok && f == float64(int64(f))
+	case "null":
+		return v == nil
 	case "boolean":
 		_, ok := v.(bool)
 		return ok
@@ -651,4 +633,85 @@ func jsonValueMatchesType(v any, want string) bool {
 		return ok
 	}
 	return true
+}
+
+// jsonNumberValue reads a decoded JSON number, whichever Go type the
+// decoder produced (float64, json.Number, or a Go integer from in-process
+// callers).
+func jsonNumberValue(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+// errInvalidCursor is the pagination spec's answer to a cursor this server
+// did not issue: it never paginates, so any cursor is invalid.
+var errInvalidCursor = &MCPError{Code: ErrorCodeInvalidParams, Message: "Invalid cursor"}
+
+// cursorIn reports whether params carry a non-empty cursor. params may be the
+// decoded HTTP params (map) or a stdio handler's raw params.
+func cursorIn(params any) bool {
+	switch p := params.(type) {
+	case map[string]any:
+		c, present := p["cursor"]
+		if !present || c == nil {
+			return false
+		}
+		s, isString := c.(string)
+		return !isString || s != ""
+	case json.RawMessage:
+		var shape struct {
+			Cursor any `json:"cursor"`
+		}
+		if len(p) == 0 || json.Unmarshal(p, &shape) != nil || shape.Cursor == nil {
+			return false
+		}
+		s, isString := shape.Cursor.(string)
+		return !isString || s != ""
+	}
+	return false
+}
+
+// isModernProtocolErrorCode reports whether code is one the 2026-07-28
+// transport reserves for a request's own headers and version. A handler
+// (a federated call to an upstream server, say) that surfaces one is
+// reporting its own hop's problem, which this server must not relay to its
+// caller as if the caller's request were at fault; it is reported as an
+// internal error with the message kept.
+func isModernProtocolErrorCode(code int) bool {
+	switch code {
+	case ErrorCodeHeaderMismatch, ErrorCodeMissingRequiredClientCapability, ErrorCodeUnsupportedProtocolVersion,
+		ErrorCodeParseError, ErrorCodeInvalidRequest, ErrorCodeMethodNotFound:
+		// The last three describe the request envelope, which a handler
+		// never judges; relaying them would misstate the failure.
+		return true
+	}
+	return false
 }

@@ -223,6 +223,17 @@ func (c *Client) runEventStreamReader(ctx context.Context, label string, legacy 
 			slog.Info("mcp: server does not offer a notification stream; not retrying", "server", c.baseURL, "stream", label)
 			return
 		}
+		if errors.Is(err, errSessionNotFound) {
+			// 2025-11-25 §Session Management: a 404 for a request carrying
+			// the session id means the client MUST start a new session.
+			// Re-initialize and reconnect at once; the old stream's event
+			// ids belong to the dead session.
+			if err := c.reinitializeLegacySession(ctx, c.getSessionID()); err == nil {
+				state = eventStreamState{}
+				backoff = time.Second
+				continue
+			}
+		}
 		if connected {
 			backoff = time.Second
 		}
@@ -261,6 +272,9 @@ func (c *Client) readEventStream(ctx context.Context, legacy bool, connect event
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusMethodNotAllowed {
 		return false, errStreamNotOffered
+	}
+	if legacy && resp.StatusCode == http.StatusNotFound && c.getSessionID() != "" {
+		return false, errSessionNotFound // the session is gone: start a new one
 	}
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("event stream returned status %d", resp.StatusCode)

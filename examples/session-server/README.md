@@ -103,7 +103,6 @@ server.SetSessionManager(mcp.NewJWTSessionManager(signingKey, 30*time.Minute))
 
 The server supports older MCP protocol versions:
 
-- `2024-11-05`: Basic capabilities
 - `2025-03-26`: With listChanged support
 - `2025-06-18`: Enhanced capabilities
 - `2025-11-25`: Latest spec with full session management

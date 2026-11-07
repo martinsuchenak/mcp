@@ -16,7 +16,7 @@ import (
 
 // Support for MCP protocol revision 2026-07-28 (the "Modern" era): a
 // stateless, per-request model that replaces the initialize handshake (the
-// "Legacy" era, 2024-11-05..2025-11-25) with protocol version, client
+// "Legacy" era, 2025-03-26..2025-11-25) with protocol version, client
 // identity, and capabilities carried on every request's _meta.
 //
 // A Server implements both eras simultaneously ("Dual-era"): a request is
@@ -921,12 +921,20 @@ func (s *Server) handleSubscriptionsListen(w http.ResponseWriter, r *http.Reques
 			// from an abrupt client/transport disconnect (the
 			// r.Context().Done() case below, which gets no such response
 			// since there is no longer anyone to receive it).
+			// The cancellation pattern has the server announce the teardown
+			// of a listen with notifications/cancelled naming the request;
+			// the completion result then closes it as subscriptions describe.
+			_ = writeSSEData(w, MCPNotification{
+				JSONRPC: "2.0",
+				Method:  "notifications/cancelled",
+				Params:  map[string]any{"requestId": req.ID, "reason": "server shutting down"},
+			})
 			_ = writeSSEData(w, MCPResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
 				Result: map[string]any{
 					"resultType": "complete",
-					"_meta":      map[string]any{metaKeySubscriptionID: req.ID},
+					"_meta":      map[string]any{metaKeySubscriptionID: req.ID, metaKeyServerInfo: s.serverInfoMap()},
 				},
 			})
 			flusher.Flush()

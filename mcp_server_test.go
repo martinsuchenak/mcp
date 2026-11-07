@@ -47,7 +47,7 @@ func TestInitialize_DefaultsAndVersion(t *testing.T) {
 
 	// initialize with supported older version
 	_, rpc = doRPC(t, handler, MCPRequest{JSONRPC: "2.0", ID: 2, Method: "initialize", Params: map[string]any{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "t", "version": "1"},
 	}}, nil)
@@ -148,8 +148,13 @@ func TestHandleRequest_BadInputs(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK { // JSON-RPC error should still be 200
-		t.Fatalf("expected 200 (json-rpc envelope), got %d", rr.Code)
+	// A body that is not a JSON-RPC message is input the server cannot
+	// accept: 400 with a JSON-RPC parse error envelope (as the official SDKs do).
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (parse error envelope), got %d", rr.Code)
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"code":-32700`)) {
+		t.Fatalf("expected a parse error body, got %s", rr.Body.String())
 	}
 }
 
@@ -161,7 +166,7 @@ func TestProtocolVersionHeader_WhitespaceTrimming(t *testing.T) {
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
 	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(headerProtocolVersion, "  2024-11-05  ") // whitespace padded
+	req.Header.Set(headerProtocolVersion, "  2025-03-26  ") // whitespace padded
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 

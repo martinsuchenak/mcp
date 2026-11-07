@@ -1,20 +1,18 @@
 # Protocol Support Guide
 
-The MCP library supports every MCP protocol revision from 2024-11-05 through the
+The MCP library supports every MCP protocol revision from 2025-03-26 through the
 current 2026-07-28, across two distinct eras, on both `Server` and `Client`, over
 both HTTP and stdio. Detection and behavior selection are automatic — there is no
-configuration required to get this. (One transport exception: the `Client`
-speaks 2024-11-05 over Streamable HTTP and stdio only. The separate HTTP+SSE
-transport that 2024-11-05 originally defined — a `GET` stream announcing a POST
-URL in an `endpoint` event — is not implemented, so a server that offers only
-that transport cannot be reached over HTTP.)
+configuration required to get this. (2024-11-05, and its separate HTTP+SSE
+transport, are no longer supported: a client that asks for it is negotiated
+up to the latest Legacy revision, as the lifecycle spec allows.)
 
 ## Legacy and Modern
 
 The spec's revision history splits into two eras with genuinely different wire
 models:
 
-- **Legacy** (`2024-11-05` through `2025-11-25`): the familiar `initialize`
+- **Legacy** (`2025-03-26` through `2025-11-25`): the familiar `initialize`
   handshake negotiates a session once, and subsequent requests are implicitly
   scoped to that session.
 - **Modern** (`2026-07-28`, current): stateless and per-request. There is no
@@ -62,18 +60,12 @@ value is an invalid-result error.
 
 ## Supported Protocol Versions
 
-- **2024-11-05** (Legacy, minimum supported; `Client`: Streamable HTTP and stdio only)
 - **2025-03-26** (Legacy)
 - **2025-06-18** (Legacy)
 - **2025-11-25** (Legacy, latest)
 - **2026-07-28** (Modern, current)
 
 ## Legacy Version Features
-
-### 2024-11-05 (Basic)
-
-Basic tool listing and execution, resource access, no advanced features. Use
-case: legacy clients, minimal functionality requirements.
 
 ### 2025-03-26 and Later (Enhanced)
 
@@ -88,10 +80,6 @@ allows) and removes JSON-RPC batching; 2025-11-25 adds `title`, icons and
 tool annotations on the primitives. Session management (`MCP-Session-Id`,
 including the JWT manager) is available to every Legacy revision. Use case:
 production Legacy deployments.
-
-Note: 2024-11-05 is served over Streamable HTTP and stdio. The original
-HTTP+SSE transport of that revision (a `GET` that announces an `endpoint`
-event) is not implemented, on either the server or the client.
 
 ## Modern (2026-07-28)
 
@@ -268,7 +256,7 @@ on `405` (the server offers no stream).
 
 **Client, stdio.** A server `ping` is answered with an empty result.
 `CallToolsParallel` sends one JSON-RPC batch only when the negotiated revision
-allows batching (2024-11-05, 2025-03-26); for later revisions, Modern
+allows batching (2025-03-26); for later revisions, Modern
 included, it sends concurrent individual requests.
 
 ## Version Negotiation (Legacy)
@@ -345,8 +333,8 @@ curl -X POST http://localhost:8080/mcp \
 # Legacy, oldest
 curl -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -H "MCP-Protocol-Version: 2024-11-05" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+  -H "MCP-Protocol-Version: 2025-03-26" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
 # Modern
 curl -X POST http://localhost:8080/mcp \

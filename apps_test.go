@@ -331,7 +331,7 @@ func TestVisibilityOnlyTool_WorksAcrossOlderLegacyProtocolVersions(t *testing.T)
 	ts := httptest.NewServer(http.HandlerFunc(s.HandleRequest))
 	defer ts.Close()
 
-	for _, version := range []string{"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"} {
+	for _, version := range []string{"2025-03-26", "2025-06-18", "2025-11-25"} {
 		t.Run(version, func(t *testing.T) {
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
 			req, _ := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader(body))

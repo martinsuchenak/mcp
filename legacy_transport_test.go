@@ -64,7 +64,7 @@ func legacyInitialize(t *testing.T, url, version string) string {
 // an array, and a batch of notifications alone is 202.
 func TestLegacyBatch_SupportedRevisions(t *testing.T) {
 	_, ts := legacyTestServer(t, false)
-	for _, version := range []string{"2024-11-05", "2025-03-26"} {
+	for _, version := range []string{"2025-03-26"} {
 		resp, raw := legacyPost(t, ts.URL, version, "", `[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{}}}]`)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s: status %d body %s", version, resp.StatusCode, raw)
@@ -271,20 +271,31 @@ func TestLegacyGet_OneStreamPerSession(t *testing.T) {
 	}
 }
 
-// 2024-11-05 clients are told about resources and prompts too (as empty
-// capability objects), since a client may only use advertised capabilities.
-func TestLegacyInitialize_20241105Capabilities(t *testing.T) {
+// A revision older than any supported one (2024-11-05 was dropped) is
+// negotiated up to the latest, per the lifecycle spec: the server answers
+// with a version it supports and the client decides. The result always
+// advertises tools, resources and prompts.
+func TestLegacyInitialize_UnsupportedOldRevisionNegotiatesLatest(t *testing.T) {
 	_, ts := legacyTestServer(t, false)
 	_, raw := legacyPost(t, ts.URL, "", "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
 	var out struct {
 		Result struct {
-			Capabilities map[string]any `json:"capabilities"`
+			ProtocolVersion string         `json:"protocolVersion"`
+			Capabilities    map[string]any `json:"capabilities"`
 		} `json:"result"`
 	}
 	_ = json.Unmarshal(raw, &out)
+	if out.Result.ProtocolVersion != MCPProtocolVersionLatest {
+		t.Fatalf("protocolVersion = %q, want %q: %s", out.Result.ProtocolVersion, MCPProtocolVersionLatest, raw)
+	}
 	for _, key := range []string{"tools", "resources", "prompts"} {
 		if _, ok := out.Result.Capabilities[key]; !ok {
 			t.Errorf("capabilities missing %q: %s", key, raw)
 		}
+	}
+	// And a request naming it in the header is refused as unsupported.
+	resp, raw := legacyPost(t, ts.URL, "2024-11-05", "", `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(raw), "Unsupported MCP-Protocol-Version") {
+		t.Fatalf("status %d body %s, want 400 unsupported version", resp.StatusCode, raw)
 	}
 }

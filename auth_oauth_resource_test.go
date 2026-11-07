@@ -128,9 +128,17 @@ func TestCoversResource(t *testing.T) {
 	}
 	u, _ := http.NewRequest(http.MethodGet, "https://h.example/mcp?show_all=true", nil)
 	for resource, want := range cases {
-		if got := coversResource(resource, u.URL); got != want {
-			t.Errorf("coversResource(%q) = %v, want %v", resource, got, want)
+		if got := coversResource(resource, u.URL, true); got != want {
+			t.Errorf("coversResource(%q, parent allowed) = %v, want %v", resource, got, want)
 		}
+	}
+	// A document found at the path-inserted or challenge URL must name the
+	// server exactly (RFC 9728 section 3.3): a parent is not enough there.
+	if coversResource("https://h.example", u.URL, false) {
+		t.Error("a parent resource was accepted for an exact-match document")
+	}
+	if !coversResource("https://h.example/mcp/", u.URL, false) {
+		t.Error("the server's own resource (trailing slash) was refused")
 	}
 }
 

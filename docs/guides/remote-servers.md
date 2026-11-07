@@ -483,20 +483,66 @@ registration answered with anything but 2xx is an error naming the server's
 
 ### Protecting your server
 
-The library does not provide resource server helpers. An MCP server that
-requires authorization must:
+An MCP server that requires authorization is an OAuth 2.1 resource server.
+The library provides the pieces the authorization spec requires of one, as
+opt-in helpers you mount in front of `Server.HandleRequest`:
 
-- answer unauthenticated requests with `401` and
-  `WWW-Authenticate: Bearer resource_metadata="https://host/.well-known/oauth-protected-resource/mcp"`
-  (optionally with `scope="..."`);
-- serve its protected resource metadata at
-  `/.well-known/oauth-protected-resource[/path]`, with `resource` set to its
-  own URL and `authorization_servers` naming its authorization server;
-- validate every token, including that its audience is this server;
-- answer a token lacking a required scope with `403` and
-  `WWW-Authenticate: Bearer error="insufficient_scope", scope="..."`;
-- never forward the token it received to upstream services: obtain a
-  separate token for them.
+```go
+v, err := mcp.NewJWTValidator(mcp.JWTValidatorConfig{
+    Issuer: "https://idp.example/realms/acme", // tokens' iss; keys via OIDC discovery
+})
+if err != nil {
+    log.Fatal(err)
+}
+rs := &mcp.ResourceServer{
+    Resource:             "https://mcp.example.com/mcp",          // canonical URI; must appear in tokens' aud
+    AuthorizationServers: []string{"https://idp.example/realms/acme"},
+    ScopesSupported:      []string{"mcp:read", "mcp:write"},      // advertised, and named in the 401 challenge
+    RequiredScopes:       []string{"mcp:read"},                    // 403 insufficient_scope without it
+    ResourceName:         "Example MCP",
+    ValidateToken:        v.Validate,
+}
+mux := http.NewServeMux()
+rs.Mount(mux, http.HandlerFunc(server.HandleRequest)) // /mcp (protected) + the metadata document
+```
+
+What this gives you:
+
+- `GET /.well-known/oauth-protected-resource/mcp` (and the root form) serves the
+  RFC 9728 metadata document naming the resource, its authorization servers
+  and scopes, so clients can discover where to get a token.
+- A request without a token is answered `401` with
+  `WWW-Authenticate: Bearer resource_metadata="…", scope="…"`; an invalid,
+  expired or wrong-audience token adds `error="invalid_token"`.
+- A valid token lacking a required scope is answered `403` with
+  `WWW-Authenticate: Bearer error="insufficient_scope", scope="…", resource_metadata="…"`,
+  which is what a client's step-up flow reads.
+- Every accepted token must name this server in its audience (the spec's
+  MUST), or one of `Audiences` when your identity provider uses an API
+  identifier instead.
+- Tool handlers see the caller through `mcp.TokenInfoFromContext(ctx)`:
+  subject, scopes, expiry and the raw claims.
+
+`JWTValidator` verifies JWT access tokens against the issuer's JSON Web Key
+Set (RS/PS/ES/EdDSA, discovered from the issuer's OpenID configuration unless
+`JWKSURL` is given), checks `iss`, `exp` and `nbf`, and rejects
+sender-constrained tokens (`cnf`) unless `AllowConfirmation` is set. Set
+`RequireAccessTokenType` when your provider marks access tokens `at+jwt`, so an
+ID token cannot be presented instead. For a server guarded by a configured
+secret rather than an identity provider, `mcp.StaticTokenValidator` compares in
+constant time; any other scheme (introspection, an opaque session store) is a
+`TokenValidator` of your own.
+
+Servers whose identity depends on the request (one deployment serving several
+tenants) set `ResourceFunc`, `AuthorizationServersFunc` and `MetadataURLFunc`
+instead of the fixed fields. An application that keeps its own authentication
+middleware can still produce spec-shaped refusals with `rs.Reject(w, r, err)`
+and `rs.RejectScope(w, r, scopes)`, and hand the caller to tools with
+`mcp.WithTokenInfo`.
+
+Never forward the token you received to upstream services: obtain a separate
+token for them (RFC 8693 token exchange, or the upstream's own flow). The
+helpers never log a token or echo it in a response.
 
 ## Unified Interface Benefits
 

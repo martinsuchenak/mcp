@@ -2,7 +2,7 @@
 
 When a server's tool, resource, or prompt set changes, it can push a `list_changed` notification to connected clients rather than waiting for them to poll. The client invalidates its cache and re-fetches on the next call. This works over **both HTTP (SSE) and stdio**, and propagates through federated servers automatically.
 
-A Legacy client (through 2025-11-25) receives them unsolicited once it has completed `initialize` with a revision that advertises `listChanged` (2025-03-26 and later; a 2024-11-05 client is sent none). A Modern client (2026-07-28) receives only what it asked for through `subscriptions/listen`, over HTTP and stdio alike.
+A Legacy client (2025-03-26 through 2025-11-25) receives them unsolicited once it has completed `initialize`. A Modern client (2026-07-28) receives only what it asked for through `subscriptions/listen`, over HTTP and stdio alike.
 
 The three notification methods:
 

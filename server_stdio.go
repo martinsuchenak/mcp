@@ -82,10 +82,9 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer, o
 	}
 
 	// Legacy-era change notifications are pushed to this stream only once
-	// its client has completed a Legacy initialize that advertised
-	// listChanged (2025-03-26 and later): a client is only sent the
-	// capabilities it negotiated, and a Modern (2026-07-28) client gets no
-	// unsolicited notifications at all — it opens subscriptions/listen.
+	// its client has completed a Legacy initialize (which advertises
+	// listChanged): a Modern (2026-07-28) client gets no unsolicited
+	// notifications at all — it opens subscriptions/listen.
 	// The sink is non-blocking: it queues notifications to a buffered channel
 	// and a drainer writes them under writeMu, so emit (which can run under
 	// s.mu from RegisterTool) never blocks on a slow/stuck client.
@@ -111,14 +110,19 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer, o
 	// (-32700) and the stream carries on, rather than the whole server
 	// stopping at the first malformed byte.
 	reader := bufio.NewReader(in)
+	limit := int(s.maxRequestBytes())
 	for {
 		line, err := reader.ReadBytes('\n')
+		if len(line) > limit {
+			stream.write([]byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request","data":{"details":"message too large"}}}`))
+			line = nil
+		}
 		if msg := bytes.TrimSpace(line); len(msg) > 0 {
 			s.serveStdioMessage(ctx, srv, stream, sink, &wg, msg)
 		}
 		if err != nil {
-			stream.cancelAll() // nothing can be answered on a closed stream
-			wg.Wait()          // let in-flight handlers finish
+			stream.closeStream() // subscriptions end; requests still get answered
+			wg.Wait()            // let in-flight handlers finish
 			if ctx.Err() != nil {
 				return nil // context cancelled (reader closed) — clean shutdown
 			}
@@ -137,17 +141,19 @@ type stdioStream struct {
 	write    func(line []byte)
 	mu       sync.Mutex
 	inflight map[string]*stdioInflight
+	version  string // Legacy revision negotiated by initialize, "" before
 }
 
 type stdioInflight struct {
 	cancel    context.CancelFunc
 	cancelled bool
+	listen    bool // a subscriptions/listen: ends with the stream, silently
 }
 
-func (st *stdioStream) track(key string, cancel context.CancelFunc) {
+func (st *stdioStream) track(key string, cancel context.CancelFunc, listen bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.inflight[key] = &stdioInflight{cancel: cancel}
+	st.inflight[key] = &stdioInflight{cancel: cancel, listen: listen}
 }
 
 // untrack forgets a finished request and reports whether the client had
@@ -172,19 +178,40 @@ func (st *stdioStream) cancel(key string) {
 	}
 }
 
-func (st *stdioStream) cancelAll() {
+// closeStream is called when stdin ends: open subscriptions are torn down
+// without a response (their client is gone), while ordinary requests
+// already read are left to finish and be answered — closing stdin is a
+// shutdown signal, and every request still gets its JSON-RPC response.
+func (st *stdioStream) closeStream() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	for _, e := range st.inflight {
-		e.cancel()
+		if e.listen {
+			e.cancelled = true
+			e.cancel()
+		}
 	}
+}
+
+// setVersion records the Legacy revision an initialize negotiated.
+func (st *stdioStream) setVersion(v string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.version = v
+}
+
+func (st *stdioStream) negotiatedVersion() string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.version
 }
 
 // stdioHead is the part of an inbound line the read loop itself needs.
 type stdioHead struct {
-	ID     json.RawMessage `json:"id"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
 }
 
 // stdioIDKey normalises a JSON-RPC id for inflight tracking.
@@ -213,6 +240,63 @@ func (s *Server) serveStdioMessage(ctx context.Context, srv *jsonrpc.Server, str
 	if msg[0] == '{' {
 		_ = json.Unmarshal(msg, &head)
 	}
+	writeInvalid := func(id any, details string) {
+		line, _ := json.Marshal(MCPResponse{JSONRPC: "2.0", ID: id, Error: &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request", Data: map[string]any{"details": details}}})
+		stream.write(line)
+	}
+
+	// The base protocol's rules, as the HTTP transport enforces them: a
+	// message is a JSON-RPC 2.0 object; an id is a string or an integer,
+	// never null; a client's own JSON-RPC response (an id and no method)
+	// is never answered.
+	if msg[0] == '{' && json.Valid(msg) {
+		if head.JSONRPC != "2.0" {
+			writeInvalid(nil, "JSONRPC field must be '2.0'")
+			return
+		}
+		if len(head.ID) > 0 {
+			if _, ok := decodeJSONRPCID(head.ID); !ok {
+				writeInvalid(nil, "id must be a string or an integer, and must not be null")
+				return
+			}
+			if head.Method == "" {
+				return
+			}
+		}
+	}
+
+	// A batch (JSON array) is only for a 2025-03-26 client; later revisions
+	// removed it. Each element is validated like a single message, and a
+	// Modern (2026-07-28) element is refused on its own, while its Legacy
+	// siblings are still served.
+	if msg[0] == '[' {
+		if v := stream.negotiatedVersion(); v != "" && !batchProtocolVersions[v] {
+			writeInvalid(nil, "JSON-RPC batching is not supported in protocol version "+v)
+			return
+		}
+		valid, rejected := splitStdioBatch(msg)
+		if len(rejected) > 0 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				responses := rejected
+				if len(valid) > 0 {
+					body, _ := json.Marshal(valid)
+					if resp, has := srv.HandleMessage(ctx, body); has {
+						var got []json.RawMessage
+						if json.Unmarshal(resp, &got) == nil {
+							responses = append(responses, got...)
+						} else {
+							responses = append(responses, resp)
+						}
+					}
+				}
+				line, _ := json.Marshal(responses)
+				stream.write(line)
+			}()
+			return
+		}
+	}
 
 	if head.Method == "notifications/cancelled" && len(head.ID) == 0 {
 		var params struct {
@@ -228,7 +312,7 @@ func (s *Server) serveStdioMessage(ctx context.Context, srv *jsonrpc.Server, str
 	key := ""
 	if len(head.ID) > 0 && string(bytes.TrimSpace(head.ID)) != "null" && head.Method != "" {
 		key = stdioIDKey(head.ID)
-		stream.track(key, cancel)
+		stream.track(key, cancel, head.Method == "subscriptions/listen")
 		if id, ok := decodeJSONRPCID(head.ID); ok {
 			reqCtx = context.WithValue(reqCtx, stdioRequestKey{}, &stdioRequest{id: id, write: stream.write})
 		}
@@ -243,32 +327,52 @@ func (s *Server) serveStdioMessage(ctx context.Context, srv *jsonrpc.Server, str
 			return // cancelled by the client: no response
 		}
 		if hasResp {
-			if head.Method == "initialize" {
+			if head.Method == "initialize" || msg[0] == '[' {
 				// Gate before the response goes out, so a notification
 				// emitted right after the client reads it is delivered.
-				sink.setEnabled(legacyInitializeAdvertisesListChanged(resp))
+				if version, ok := negotiatedLegacyInitialize(resp); ok {
+					stream.setVersion(version)
+					sink.setEnabled(true)
+				}
 			}
 			stream.write(resp)
 		}
 	}()
 }
 
-// legacyInitializeAdvertisesListChanged reports whether an initialize
-// response negotiated a revision whose capabilities carry listChanged, i.e.
-// whether list-changed notifications may be pushed to that client.
-func legacyInitializeAdvertisesListChanged(resp []byte) bool {
-	var out struct {
+// negotiatedLegacyInitialize finds an initialize result in a response (or a
+// batch of responses) and reports the negotiated revision; every supported
+// Legacy revision advertises listChanged, so a found result also means
+// list-changed notifications may be pushed to that client.
+func negotiatedLegacyInitialize(resp []byte) (version string, ok bool) {
+	type initResp struct {
 		Result *struct {
-			Capabilities struct {
+			ProtocolVersion string `json:"protocolVersion"`
+			Capabilities    *struct {
 				Tools map[string]any `json:"tools"`
 			} `json:"capabilities"`
 		} `json:"result"`
 	}
-	if json.Unmarshal(resp, &out) != nil || out.Result == nil {
-		return false
+	var many []initResp
+	if bytes.HasPrefix(bytes.TrimSpace(resp), []byte("[")) {
+		if json.Unmarshal(resp, &many) != nil {
+			return "", false
+		}
+	} else {
+		var one initResp
+		if json.Unmarshal(resp, &one) != nil {
+			return "", false
+		}
+		many = []initResp{one}
 	}
-	v, _ := out.Result.Capabilities.Tools["listChanged"].(bool)
-	return v
+	for _, r := range many {
+		if r.Result != nil && r.Result.Capabilities != nil && r.Result.ProtocolVersion != "" {
+			if v, _ := r.Result.Capabilities.Tools["listChanged"].(bool); v {
+				return r.Result.ProtocolVersion, true
+			}
+		}
+	}
+	return "", false
 }
 
 // stdioSubscriptionsListen serves subscriptions/listen over stdio (Modern
@@ -311,6 +415,9 @@ func (s *Server) stdioSubscriptionsListen(ctx context.Context, params json.RawMe
 		case <-ctx.Done():
 			return nil, jsonrpc.NewError(ErrorCodeInternalError, "cancelled", nil) // never sent: the request was cancelled
 		case <-s.shutdownCh:
+			cancelled, _ := json.Marshal(MCPNotification{JSONRPC: "2.0", Method: "notifications/cancelled",
+				Params: map[string]any{"requestId": req.id, "reason": "server shutting down"}})
+			req.write(cancelled)
 			return map[string]any{"_meta": meta}, nil
 		}
 	}
@@ -381,7 +488,7 @@ func newStreamNotifySink(out io.Writer, mu *sync.Mutex) *streamNotifySink {
 
 func (sn *streamNotifySink) send(method string, params any) {
 	if !sn.enabled.Load() {
-		return // not negotiated (2024-11-05) or a Modern client: no unsolicited pushes
+		return // no Legacy initialize yet, or a Modern client: no unsolicited pushes
 	}
 	select {
 	case sn.ch <- sseEvent{method: method, params: params}:
@@ -426,6 +533,9 @@ func (s *Server) newStdioDispatcher() *jsonrpc.Server {
 	}))
 
 	srv.Handle("tools/list", s.wrapStdioModern("tools/list", func(ctx context.Context, params json.RawMessage) (any, error) {
+		if cursorIn(params) {
+			return nil, jsonrpc.NewError(errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		}
 		return map[string]any{"tools": s.ListToolsWithContext(ctx)}, nil
 	}))
 
@@ -434,10 +544,16 @@ func (s *Server) newStdioDispatcher() *jsonrpc.Server {
 	}))
 
 	srv.Handle("resources/list", s.wrapStdioModern("resources/list", func(ctx context.Context, params json.RawMessage) (any, error) {
+		if cursorIn(params) {
+			return nil, jsonrpc.NewError(errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		}
 		return map[string]any{"resources": s.ListResources(ctx)}, nil
 	}))
 
 	srv.Handle("resources/templates/list", s.wrapStdioModern("resources/templates/list", func(ctx context.Context, params json.RawMessage) (any, error) {
+		if cursorIn(params) {
+			return nil, jsonrpc.NewError(errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		}
 		return map[string]any{"resourceTemplates": s.ListResourceTemplates(ctx)}, nil
 	}))
 
@@ -446,10 +562,16 @@ func (s *Server) newStdioDispatcher() *jsonrpc.Server {
 	}))
 
 	srv.Handle("prompts/list", s.wrapStdioModern("prompts/list", func(ctx context.Context, params json.RawMessage) (any, error) {
+		if cursorIn(params) {
+			return nil, jsonrpc.NewError(errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		}
 		return map[string]any{"prompts": s.ListPrompts(ctx)}, nil
 	}))
 
 	srv.Handle("skills/list", s.wrapStdioModern("skills/list", func(ctx context.Context, params json.RawMessage) (any, error) {
+		if cursorIn(params) {
+			return nil, jsonrpc.NewError(errInvalidCursor.Code, errInvalidCursor.Message, nil)
+		}
 		return map[string]any{"skills": s.ListSkillsWithContext(ctx)}, nil
 	}))
 	srv.Handle("skills/get", s.wrapStdioModern("skills/get", func(ctx context.Context, params json.RawMessage) (any, error) {
@@ -588,4 +710,33 @@ func (s *Server) stdioPromptsGet(ctx context.Context, raw json.RawMessage) (any,
 		return nil, jsonrpc.NewError(e.Code, e.Message, e.Data)
 	}
 	return resp, nil
+}
+
+// splitStdioBatch validates each element of a batch: well-formed Legacy
+// elements are returned for dispatch, the rest get their own Invalid
+// Request responses (a null or non-integer id, a wrong jsonrpc field, a
+// non-object element, or a 2026-07-28 element, which cannot be batched).
+func splitStdioBatch(msg []byte) (valid []json.RawMessage, rejected []json.RawMessage) {
+	var elems []json.RawMessage
+	if json.Unmarshal(msg, &elems) != nil {
+		return nil, nil
+	}
+	invalid := func(id any, details string) json.RawMessage {
+		line, _ := json.Marshal(MCPResponse{JSONRPC: "2.0", ID: id, Error: &MCPError{Code: ErrorCodeInvalidRequest, Message: "Invalid Request", Data: map[string]any{"details": details}}})
+		return line
+	}
+	for _, el := range elems {
+		el = bytes.TrimSpace(el)
+		var req MCPRequest
+		if perr := decodeMCPRequest(el, &req); perr != nil {
+			rejected = append(rejected, invalid(req.ID, perr.Data.(map[string]any)["details"].(string)))
+			continue
+		}
+		if isModernRequest(nil, &req) {
+			rejected = append(rejected, invalid(req.ID, "a 2026-07-28 request cannot be sent in a batch"))
+			continue
+		}
+		valid = append(valid, el)
+	}
+	return valid, rejected
 }

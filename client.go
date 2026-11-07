@@ -443,7 +443,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 // stream transport (see Initialize and WithClientProbeTimeout).
 var defaultStdioProbeTimeout = 5 * time.Second
 
-// initializeLegacy performs the Legacy-era (2024-11-05..2025-11-25)
+// initializeLegacy performs the Legacy-era (2025-03-26..2025-11-25)
 // initialize handshake. Called under c.mu, held by Initialize.
 func (c *Client) initializeLegacy(ctx context.Context) error {
 	req := MCPRequest{
@@ -835,9 +835,9 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	// symptom; the tools/list failure is the cause worth reporting. Both are
 	// wrapped: errors.Is reaches the cause, and errors.As still finds the
 	// server's *ToolError (HeaderMismatch) like on any other JSON-RPC error.
-	// A direct err.(*ToolError) assertion deliberately does not match, so a
-	// federating Server reports this as its own internal error rather than
-	// forwarding a HeaderMismatch about its upstream hop to its caller.
+	// A federating Server never forwards a HeaderMismatch about its upstream
+	// hop to its own caller (toolsCallWireError treats the Modern protocol
+	// codes as internal when they arrive through a handler).
 	if resp.Error != nil && resp.Error.Code == ErrorCodeHeaderMismatch && lookupErr != nil {
 		toolErr := &ToolError{Code: resp.Error.Code, Message: resp.Error.Message, Data: resp.Error.Data}
 		return nil, fmt.Errorf("call tool failed: could not load tool definitions to send its Mcp-Param-* headers: %w (server: %w)", lookupErr, toolErr)
@@ -1209,7 +1209,7 @@ type ParallelToolResult struct {
 // CallToolsParallel executes multiple tools concurrently and returns results in
 // the same order as the input. Over a transport with native batch support
 // (currently the stdio transport) talking to a server that negotiated a
-// protocol revision with JSON-RPC batching (2024-11-05 or 2025-03-26), all
+// protocol revision with JSON-RPC batching (2025-03-26), all
 // calls are sent as a single wire-level batch instead of one round-trip each;
 // otherwise they run as concurrent individual calls.
 func (c *Client) CallToolsParallel(ctx context.Context, calls []ToolCall) []ParallelToolResult {
@@ -1264,7 +1264,7 @@ func (c *Client) callToolsParallel(ctx context.Context, calls []ToolCall, discov
 }
 
 // allowsBatching reports whether the negotiated protocol revision permits
-// JSON-RPC batches: only 2024-11-05 and 2025-03-26. Batching was removed in
+// JSON-RPC batches: only 2025-03-26. Batching was removed in
 // 2025-06-18 and is absent from the Modern era, so a client must not send a
 // JSON array to a server speaking any later revision.
 func (c *Client) allowsBatching() bool {
@@ -1273,7 +1273,7 @@ func (c *Client) allowsBatching() bool {
 	if c.era != eraLegacy {
 		return false
 	}
-	return c.protocolVersion == "2024-11-05" || c.protocolVersion == "2025-03-26"
+	return c.protocolVersion == "2025-03-26"
 }
 
 // callToolsBatch sends every call as one wire-level batch via bt, applying the

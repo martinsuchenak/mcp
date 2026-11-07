@@ -76,10 +76,15 @@ func DiscoverOAuthMetaWithClient(ctx context.Context, client *http.Client, serve
 	if err != nil {
 		return nil, err
 	}
+	client = clientCheckingRedirects(client)
 	meta, found, why := protectedResourceOAuthMeta(ctx, client, u)
 	if meta != nil {
 		return meta, nil
 	}
+	// The host-root fallback is for a server that publishes no protected
+	// resource metadata at all: every address answered "not here". An
+	// address that failed in any other way, or a document for another
+	// resource, means the server may well have one, so there is no fallback.
 	if !found {
 		legacy, err := legacyOAuthMeta(ctx, client, u)
 		if legacy != nil {
@@ -128,6 +133,7 @@ func legacyOAuthMeta(ctx context.Context, client *http.Client, u *url.URL) (*OAu
 func protectedResourceOAuthMeta(ctx context.Context, client *http.Client, u *url.URL) (*OAuthMeta, bool, error) {
 	metadataURLs, challengeScope, why := protectedResourceMetadataURLs(ctx, client, u)
 	found := false
+	rootURL := originURL(u, "/.well-known/oauth-protected-resource")
 	for _, metadataURL := range metadataURLs {
 		var prm struct {
 			Resource             string   `json:"resource"`
@@ -135,10 +141,18 @@ func protectedResourceOAuthMeta(ctx context.Context, client *http.Client, u *url
 			ScopesSupported      []string `json:"scopes_supported"`
 		}
 		if err := getJSON(ctx, client, metadataURL, &prm); err != nil {
+			var notThere *notPublishedError
+			if !errors.As(err, &notThere) || notThere.code != http.StatusNotFound {
+				found = true // the server may publish one; do not fall back
+			}
 			why = moreTelling(why, err)
 			continue
 		}
-		if !coversResource(prm.Resource, u) {
+		// RFC 9728 section 3.3: the document's resource must be identical to
+		// what the client asked about. Only the host-root document, which
+		// MCP lets describe a whole host, may name a parent of the server.
+		if !coversResource(prm.Resource, u, metadataURL == rootURL) {
+			found = true
 			why = moreTelling(why, fmt.Errorf("%s is for another resource (%s)", metadataURL, prm.Resource))
 			continue
 		}
@@ -181,6 +195,9 @@ func protectedResourceMetadataURLs(ctx context.Context, client *http.Client, u *
 		challenges = unauthorizedChallenges(ctx, client, u, http.MethodPost)
 	}
 	for _, params := range bearerChallenges(challenges) {
+		if scope == "" {
+			scope = params["scope"] // the spec's scope selection reads it from any Bearer challenge
+		}
 		raw, ok := params["resource_metadata"]
 		if !ok {
 			continue
@@ -194,9 +211,6 @@ func protectedResourceMetadataURLs(ctx context.Context, client *http.Client, u *
 			continue
 		}
 		urls = append(urls, ref.String())
-		if scope == "" {
-			scope = params["scope"]
-		}
 	}
 	if path := strings.TrimSuffix(u.Path, "/"); path != "" {
 		urls = append(urls, originURL(u, "/.well-known/oauth-protected-resource"+path))
@@ -314,13 +328,16 @@ func readParamValue(s string) (string, string) {
 
 // coversResource reports whether resource, the identifier a protected resource metadata document is for, is the MCP
 // server at u or a resource containing it: same scheme and host, and a path that is u's or one of its parents.
-func coversResource(resource string, u *url.URL) bool {
+func coversResource(resource string, u *url.URL, allowParent bool) bool {
 	r, err := url.Parse(resource)
 	if err != nil || !strings.EqualFold(r.Scheme, u.Scheme) || !strings.EqualFold(r.Host, u.Host) {
 		return false
 	}
-	rp, up := strings.TrimSuffix(r.Path, "/"), strings.TrimSuffix(u.Path, "/")
-	return rp == "" || rp == up || strings.HasPrefix(up, rp+"/")
+	rp, up := strings.TrimSuffix(r.EscapedPath(), "/"), strings.TrimSuffix(u.EscapedPath(), "/")
+	if rp == up {
+		return true
+	}
+	return allowParent && (rp == "" || strings.HasPrefix(up, rp+"/"))
 }
 
 // authorizationServerMeta reads the metadata of the authorization server issuer, in the order the MCP authorization
@@ -435,6 +452,7 @@ func originURL(u *url.URL, path string) string {
 type notPublishedError struct {
 	url    string
 	status string
+	code   int
 }
 
 func (e *notPublishedError) Error() string { return e.url + ": " + e.status }
@@ -453,7 +471,7 @@ func getJSON(ctx context.Context, client *http.Client, target string, v any) err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return &notPublishedError{url: target, status: resp.Status}
+		return &notPublishedError{url: target, status: resp.Status, code: resp.StatusCode}
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxMetadataBytes)).Decode(v); err != nil {
 		return fmt.Errorf("%s: %w", target, err)
@@ -487,6 +505,13 @@ func RegisterOAuthClientWithClient(ctx context.Context, client *http.Client, reg
 	o := registerOptions{applicationType: applicationTypeFor(redirectURI)}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	// The MCP authorization spec: redirect URIs MUST be localhost or https.
+	// A native app's private-use scheme (RFC 8252 section 7.1) is neither
+	// and is allowed too; what is refused is plain http to a real host.
+	if ru, err := url.Parse(redirectURI); err != nil || ru.Scheme == "" ||
+		((strings.EqualFold(ru.Scheme, "http") || strings.EqualFold(ru.Scheme, "https")) && checkFetchURL(ru) != nil) {
+		return "", fmt.Errorf("redirect URI %q must be https, a loopback address, or a private-use scheme", redirectURI)
 	}
 	body, _ := json.Marshal(map[string]any{
 		"client_name":                clientName,
@@ -645,7 +670,11 @@ func (s *resourceRefreshTokenSource) Token() (*oauth2.Token, error) {
 		"client_id":     {s.clientID},
 		"resource":      {s.resource},
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, s.tokenURL, strings.NewReader(form.Encode()))
+	// A token endpoint that hangs must not hold every caller (GetAuthHeader
+	// serialises refreshes), so the request is bounded.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -711,4 +740,29 @@ func (o *OAuth2Auth) GetAuthHeader() (string, error) {
 	}
 
 	return fmt.Sprintf("Bearer %s", token.AccessToken), nil
+}
+
+// clientCheckingRedirects returns a copy of client (http.DefaultClient when
+// nil) whose redirects are only followed to https or loopback-http
+// targets, so discovery and key fetches cannot be redirected onto plain
+// http. The caller's own CheckRedirect, if any, still applies afterwards.
+func clientCheckingRedirects(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	inner := client.CheckRedirect
+	c := *client
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := checkFetchURL(req.URL); err != nil {
+			return fmt.Errorf("redirect to %s refused: %w", req.URL, err)
+		}
+		if inner != nil {
+			return inner(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &c
 }

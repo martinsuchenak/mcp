@@ -129,18 +129,12 @@ func TestStdioCancellation(t *testing.T) {
 	}
 }
 
-// Legacy list-changed pushes are gated on a completed initialize that
-// advertised listChanged: nothing before initialize, nothing for
-// 2024-11-05, the spec's method name afterwards.
+// Legacy list-changed pushes are gated on a completed initialize:
+// nothing before it, the spec's method name afterwards.
 func TestStdioListChangedGating(t *testing.T) {
 	s := stdioToolServer(t)
 	h := newStdioHarness(t, s)
 
-	s.NotifyToolsChanged()
-	h.none(t, 200*time.Millisecond)
-
-	h.send(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
-	h.next(t, 2*time.Second)
 	s.NotifyToolsChanged()
 	h.none(t, 200*time.Millisecond)
 
@@ -202,6 +196,9 @@ func TestStdioModernSubscriptionsListenGracefulClose(t *testing.T) {
 	h.send(t, `{"jsonrpc":"2.0","id":"sub-2","method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true},`+meta+`}}`)
 	h.next(t, 2*time.Second) // ack
 	s.Shutdown()
+	if l := h.next(t, 2*time.Second); !strings.Contains(l, `"method":"notifications/cancelled"`) || !strings.Contains(l, `"requestId":"sub-2"`) {
+		t.Fatalf("want notifications/cancelled first, got %s", l)
+	}
 	l := h.next(t, 2*time.Second)
 	if !strings.Contains(l, `"id":"sub-2"`) || !strings.Contains(l, `"resultType":"complete"`) || !strings.Contains(l, `"io.modelcontextprotocol/subscriptionId":"sub-2"`) {
 		t.Fatalf("want completion result, got %s", l)
@@ -235,7 +232,7 @@ func TestModernReservedErrorCodeRemapped(t *testing.T) {
 // otherwise the result is a tool execution error, not an invalid result.
 func TestStructuredOutputConformance(t *testing.T) {
 	s := NewServer("s", "1")
-	s.RegisterTool(NewTool("weather", "w", Output(Number("temp", "", Required()), String("cond", "", Required()))), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+	s.RegisterTool(NewTool("weather", "w", String("mode", "test mode"), Output(Number("temp", "", Required()), String("cond", "", Required()))), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
 		switch req.StringOr("mode", "") {
 		case "none":
 			return NewToolResponseText("just text"), nil

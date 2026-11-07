@@ -12,9 +12,9 @@ func TestCapabilitiesByProtocolVersion(t *testing.T) {
 	s := NewServer("s", "1")
 	h := http.HandlerFunc(s.HandleRequest)
 
-	// old version 2024-11-05
+	// oldest supported version
 	body := MCPRequest{JSONRPC: "2.0", ID: 1, Method: "initialize", Params: map[string]any{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "n", "version": "v"},
 	}}
