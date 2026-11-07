@@ -28,14 +28,24 @@ const (
 	// Prefer using NewToolErrorInternal() helper.
 	ErrorCodeInternalError = -32603
 
-	// ErrorCodeImplementationErrorStart is the start of the implementation-defined
-	// server error range (-32000 to -32099). Use codes in this range for
-	// application-specific errors. Create with NewToolError().
+	// ErrorCodeImplementationErrorStart is the start of JSON-RPC's
+	// implementation-defined server error range (-32000 to -32099).
+	//
+	// Do not pick new application codes here: MCP 2026-07-28 reserves
+	// -32020..-32099 for protocol-defined codes (implementations MUST NOT
+	// emit others in that range) and says new implementations SHOULD NOT use
+	// -32000..-32019 either. Application-specific errors should use a code
+	// outside -32768..-32000, and tool failures should be tool execution
+	// errors (NewToolResponseError) rather than protocol errors at all.
 	ErrorCodeImplementationErrorStart = -32000
 
-	// ErrorCodeImplementationErrorEnd is the end of the implementation-defined
-	// server error range.
+	// ErrorCodeImplementationErrorEnd is the end of that range.
 	ErrorCodeImplementationErrorEnd = -32099
+
+	// ErrorCodeResourceNotFound is the Legacy (through 2025-11-25) code for a
+	// resources/read of an unknown resource. 2026-07-28 withdraws it in
+	// favour of ErrorCodeInvalidParams, which the Modern path uses.
+	ErrorCodeResourceNotFound = -32002
 
 	// ErrorCodeHeaderMismatch indicates a Modern-era (protocol revision
 	// 2026-07-28+) request's mirrored HTTP headers (MCP-Protocol-Version,
@@ -106,13 +116,22 @@ func NewToolErrorInternal(message string) error {
 	}
 }
 
-// NewToolError creates a custom MCP error with a specific code.
-// Use codes in the range -32000 to -32099 for application-specific errors.
-// The data parameter can include additional error details and will be serialized to JSON.
+// NewToolError creates a custom MCP protocol error with a specific code.
+// Reserve it for genuine protocol-level failures; a failure of the tool's own
+// work (an upstream API error, a business rule, bad input values) should be
+// a tool execution error — return NewToolResponseError, or simply a plain
+// error, which the server reports inside the result with isError set so the
+// model can read it and self-correct.
+//
+// Pick application-specific codes outside -32768..-32000: 2026-07-28
+// reserves -32020..-32099 for the protocol (a Modern client is never sent a
+// foreign code from that range — it is remapped to -32603, with the original
+// kept in data) and discourages -32000..-32019 for new implementations. The
+// data parameter can include additional error details and will be serialized to JSON.
 //
 // Example:
 //
-//	return nil, mcp.NewToolError(-32001, "Rate limit exceeded", map[string]any{
+//	return nil, mcp.NewToolError(1001, "Rate limit exceeded", map[string]any{
 //	    "retry_after": 60,
 //	    "limit": 100,
 //	})

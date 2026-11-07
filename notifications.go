@@ -2,12 +2,36 @@ package mcp
 
 import "sync"
 
-// MCP notification method names for list-change signalling.
+// MCP notification method names for list-change signalling, as every
+// protocol revision (2024-11-05 through 2026-07-28) spells them.
 const (
-	NotificationToolsChanged     = "notifications/tools/listChanged"
-	NotificationResourcesChanged = "notifications/resources/listChanged"
-	NotificationPromptsChanged   = "notifications/prompts/listChanged"
+	NotificationToolsChanged     = "notifications/tools/list_changed"
+	NotificationResourcesChanged = "notifications/resources/list_changed"
+	NotificationPromptsChanged   = "notifications/prompts/list_changed"
 )
+
+// Pre-v0.34 releases of this library emitted (and listened for) a camelCase
+// spelling the spec never used. The Client still accepts it so a newer
+// client keeps working against a server built with an older release.
+const (
+	legacyNotificationToolsChanged     = "notifications/tools/listChanged"
+	legacyNotificationResourcesChanged = "notifications/resources/listChanged"
+	legacyNotificationPromptsChanged   = "notifications/prompts/listChanged"
+)
+
+// canonicalNotificationMethod maps the pre-v0.34 camelCase spelling of a
+// list-changed notification to the spec's name; anything else passes through.
+func canonicalNotificationMethod(method string) string {
+	switch method {
+	case legacyNotificationToolsChanged:
+		return NotificationToolsChanged
+	case legacyNotificationResourcesChanged:
+		return NotificationResourcesChanged
+	case legacyNotificationPromptsChanged:
+		return NotificationPromptsChanged
+	}
+	return method
+}
 
 // notificationSink delivers one outbound notification to a single connected
 // client. Implementations are transport-specific (HTTP SSE, stdio peer).

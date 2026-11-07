@@ -170,8 +170,11 @@ func TestAddSale_WrongParamType(t *testing.T) {
 	defer server.Close()
 
 	result := post(t, server.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_sale","arguments":{"date":"2026-09-15","product":"Widget","amount":"not-a-number"}}}`)
-	if result["error"] == nil {
-		t.Fatal("expected an error when amount is not a number")
+	// A value in the wrong format is a tool execution error: reported in
+	// the result with isError, so the model can correct it (MCP tools spec).
+	res, _ := result["result"].(map[string]any)
+	if result["error"] != nil || res == nil || res["isError"] != true {
+		t.Fatalf("expected an isError result when amount is not a number, got %v", result)
 	}
 }
 

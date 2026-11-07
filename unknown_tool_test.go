@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -19,8 +20,9 @@ func TestUnknownTool_HTTPEnvelope(t *testing.T) {
 	http.HandlerFunc(s.HandleRequest).ServeHTTP(rr, req)
 	var r MCPResponse
 	_ = json.NewDecoder(rr.Body).Decode(&r)
-	if r.Error == nil || r.Error.Code != ErrorCodeInternalError {
-		t.Fatalf("expected internal error envelope for unknown tool, got %+v", r.Error)
+	// The spec's own example: a protocol error, -32602 "Unknown tool: ...".
+	if r.Error == nil || r.Error.Code != ErrorCodeInvalidParams || !strings.HasPrefix(r.Error.Message, "Unknown tool: nope") {
+		t.Fatalf("expected -32602 Unknown tool for unknown tool, got %+v", r.Error)
 	}
 }
 

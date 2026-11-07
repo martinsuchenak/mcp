@@ -12,6 +12,21 @@ import (
 	"github.com/paularlott/jsonrpc"
 )
 
+// stdioModernKey marks a stdio handler context as serving a Modern-era
+// (2026-07-28) request, so shared result/error shaping (toolsCallResult,
+// resourcesReadWireError) can tell the eras apart without HTTP headers.
+type stdioModernKey struct{}
+
+func withStdioModern(ctx context.Context) context.Context {
+	return context.WithValue(ctx, stdioModernKey{}, true)
+}
+
+// isStdioModern reports whether ctx belongs to a Modern-era stdio request.
+func isStdioModern(ctx context.Context) bool {
+	v, _ := ctx.Value(stdioModernKey{}).(bool)
+	return v
+}
+
 // StdioOption configures a stdio MCP server run.
 type StdioOption func(*stdioConfig)
 
@@ -286,16 +301,11 @@ func (s *Server) stdioToolsCall(ctx context.Context, raw json.RawMessage) (any, 
 	}
 
 	response, err := s.CallTool(ctx, params.Name, params.Arguments)
-	if err != nil {
-		e := s.toolsCallWireError(ctx, params.Name, err)
-		return nil, jsonrpc.NewError(e.Code, e.Message, e.Data)
+	result, wireErr := s.toolsCallResult(ctx, params.Name, response, err, !isStdioModern(ctx))
+	if wireErr != nil {
+		return nil, jsonrpc.NewError(wireErr.Code, wireErr.Message, wireErr.Data)
 	}
-
-	return ToolResult{
-		Content:           response.Content,
-		StructuredContent: response.StructuredContent,
-		IsError:           false,
-	}, nil
+	return result, nil
 }
 
 func (s *Server) stdioResourcesRead(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -311,7 +321,7 @@ func (s *Server) stdioResourcesRead(ctx context.Context, raw json.RawMessage) (a
 
 	resp, err := s.ReadResource(ctx, params.URI)
 	if err != nil {
-		e := resourcesReadWireError(params.URI, err)
+		e := resourcesReadWireError(params.URI, err, !isStdioModern(ctx))
 		return nil, jsonrpc.NewError(e.Code, e.Message, e.Data)
 	}
 	return resp, nil

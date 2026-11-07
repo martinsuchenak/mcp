@@ -211,8 +211,10 @@ func TestRemoteProvider_OnServerErrorNotCalledForToolError(t *testing.T) {
 	if _, err := p.ExecuteTool(context.Background(), "svc__explicit_tool_error", nil); err == nil {
 		t.Fatal("expected an error from the tool call")
 	}
-	if _, err := p.ExecuteTool(context.Background(), "svc__plain_error", nil); err == nil {
-		t.Fatal("expected an error from the tool call")
+	// A plain handler error is a tool execution error: reported inside the
+	// result with isError set (per the spec), not as a JSON-RPC error.
+	if resp, err := p.ExecuteTool(context.Background(), "svc__plain_error", nil); err != nil || resp == nil || !resp.IsError {
+		t.Fatalf("expected an isError result from the tool call, got resp=%+v err=%v", resp, err)
 	}
 	if calls != 0 {
 		t.Fatalf("expected OnServerError NOT called for application-level tool errors, got %d calls", calls)

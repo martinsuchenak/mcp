@@ -724,6 +724,7 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	return &ToolResponse{
 		Content:           result.Content,
 		StructuredContent: result.StructuredContent,
+		IsError:           result.IsError,
 	}, nil
 }
 
@@ -1143,6 +1144,7 @@ func decodeToolResult(resp *MCPResponse) *ToolResponse {
 	return &ToolResponse{
 		Content:           result.Content,
 		StructuredContent: result.StructuredContent,
+		IsError:           result.IsError,
 	}
 }
 
@@ -1224,6 +1226,12 @@ func parseToolsResult(result any) ([]MCPTool, error) {
 						if desc, ok := toolMap["description"].(string); ok {
 							tool.Description = desc
 						}
+						if title, ok := toolMap["title"].(string); ok {
+							tool.Title = title
+						}
+						if ann, ok := toolMap["annotations"]; ok {
+							tool.Annotations = toolAnnotationsFromRaw(ann)
+						}
 						if schema, ok := toolMap["inputSchema"]; ok {
 							tool.InputSchema = schema
 						}
@@ -1256,4 +1264,18 @@ func parseToolsResult(result any) ([]MCPTool, error) {
 		return nil, err
 	}
 	return parsed.Tools, nil
+}
+
+// toolAnnotationsFromRaw decodes a tool's annotations object as a remote
+// server sent it, so federation passes the hints through unchanged.
+func toolAnnotationsFromRaw(raw any) *ToolAnnotations {
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var ann ToolAnnotations
+	if json.Unmarshal(b, &ann) != nil {
+		return nil
+	}
+	return &ann
 }

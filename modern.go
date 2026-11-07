@@ -19,10 +19,11 @@ import (
 // identity, and capabilities carried on every request's _meta.
 //
 // A Server implements both eras simultaneously ("Dual-era"): a request is
-// routed to the Modern path only when it carries a Modern signal (the
-// Mcp-Method header on HTTP, or io.modelcontextprotocol/protocolVersion in
-// _meta on any transport); otherwise it falls through to the existing Legacy
-// code, completely unchanged. See https://modelcontextprotocol.io/specification/2026-07-28
+// routed to the Modern path only when its body claims a Modern revision in
+// io.modelcontextprotocol/protocolVersion _meta (any transport), or, on
+// HTTP, when its MCP-Protocol-Version header names a Modern revision (a
+// malformed Modern request, refused there); otherwise it falls through to
+// the existing Legacy code, completely unchanged. See isModernRequest. See https://modelcontextprotocol.io/specification/2026-07-28
 // and docs/guides/protocol-support.md for the full picture.
 //
 // Known gaps, deliberately out of scope for this pass (see the guide):
@@ -102,27 +103,38 @@ func allSupportedProtocolVersions() []string {
 
 // isModernRequest reports whether an incoming request should be handled by
 // the Modern (per-request, stateless) code path rather than falling through
-// to the existing Legacy handshake-based one. Detection never looks at the
-// URL or HTTP method — only signals a real Modern client sends: the
-// Mcp-Method header (HTTP-only), or the io.modelcontextprotocol/protocolVersion
-// _meta field (any transport). A Legacy request has neither and is completely
-// unaffected.
+// to the existing Legacy handshake-based one.
 //
-// Mcp-Method alone is not proof: Legacy clients send it too (mcp-remote and
-// Claude Code add Mcp-Method and Mcp-Name to every request while negotiating
-// 2025-11-25), with MCP-Protocol-Version naming a Legacy revision and no
-// _meta version. Such a request stays on the Legacy path; treating it as
-// Modern would fail it with a header/body version mismatch.
+// Classification is body-primary, as the 2026-07-28 versioning spec's
+// dual-era rule puts it ("a request carrying modern per-request _meta is
+// served statelessly according to this revision; an initialize request
+// selects legacy semantics") and as the official TypeScript SDK server
+// implements it: the io.modelcontextprotocol/protocolVersion _meta claim
+// decides the era on every transport, and it classifies into the era the
+// named revision belongs to. A claim naming a Legacy revision is Legacy; any
+// other claim is Modern, so an unknown (e.g. newer) revision gets the
+// Modern path's UnsupportedProtocolVersionError with the full supported list.
+//
+// The MCP-Protocol-Version header is only a cross-check: it never upgrades a
+// request without a claim into the Modern era, with one exception — a header
+// naming a Modern revision on a request with no claim is a malformed Modern
+// request, and the Modern path refuses it with HeaderMismatch (400) as the
+// spec requires rather than silently serving it as Legacy.
+//
+// The Mcp-Method / Mcp-Name headers are deliberately never an era signal.
+// Legacy clients send them too (mcp-remote stamps Mcp-Method and Mcp-Name on
+// every POST, including initialize, which carries no MCP-Protocol-Version
+// header at all); no pre-2026 spec defines them, and the Streamable HTTP
+// spec calls the body "the source of truth" for them. They are validated
+// only once a request has classified as Modern.
 func isModernRequest(r *http.Request, req *MCPRequest) bool {
-	if r != nil && r.Header.Get(headerMcpMethod) != "" && !isLegacyProtocolVersion(r.Header.Get(headerProtocolVersion)) {
-		return true
-	}
 	_, meta := modernRequestParams(req)
-	if meta == nil {
-		return false
+	if meta != nil {
+		if claim, ok := meta[metaKeyProtocolVersion].(string); ok {
+			return !isLegacyProtocolVersion(claim)
+		}
 	}
-	_, ok := meta[metaKeyProtocolVersion].(string)
-	return ok
+	return r != nil && isSupportedModernProtocolVersion(r.Header.Get(headerProtocolVersion))
 }
 
 // modernRequestParams splits a request's Params into the plain params map and
@@ -510,7 +522,7 @@ func (s *Server) wrapStdioModern(method string, handler func(ctx context.Context
 			s.mu.Unlock()
 		}
 
-		result, err := handler(ctx, params)
+		result, err := handler(withStdioModern(ctx), params)
 		if err != nil {
 			return result, err
 		}
@@ -566,22 +578,6 @@ func (s *Server) shapeModernResult(method string, result any) any {
 
 func (s *Server) handleServerDiscoverHTTP(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
 	s.writeModernResult(w, req.ID, s.buildDiscoverResult(r.Context(), GetShowAllFromRequest(r)))
-}
-
-// modernNotificationMethodName translates a Legacy listChanged notification
-// method name (camelCase) to its Modern spelling (snake_case), per the
-// subscriptions/listen spec. Unrecognized methods pass through unchanged.
-func modernNotificationMethodName(legacyMethod string) string {
-	switch legacyMethod {
-	case NotificationToolsChanged:
-		return "notifications/tools/list_changed"
-	case NotificationResourcesChanged:
-		return "notifications/resources/list_changed"
-	case NotificationPromptsChanged:
-		return "notifications/prompts/list_changed"
-	default:
-		return legacyMethod
-	}
 }
 
 // modernSubscriptionSink is a notificationSink that only forwards the
@@ -716,7 +712,7 @@ func (s *Server) handleSubscriptionsListen(w http.ResponseWriter, r *http.Reques
 		case ev := <-sink.ch:
 			if err := writeSSEData(w, MCPNotification{
 				JSONRPC: "2.0",
-				Method:  modernNotificationMethodName(ev.method),
+				Method:  ev.method,
 				Params:  map[string]any{"_meta": map[string]any{metaKeySubscriptionID: req.ID}},
 			}); err != nil {
 				return

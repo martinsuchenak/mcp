@@ -21,9 +21,13 @@ models:
 
 A `Server` built with this library implements both simultaneously ("Dual-era"):
 each incoming request is routed to whichever era it actually speaks, based only
-on a real signal from that request (the `Mcp-Method` header on HTTP, or
-`io.modelcontextprotocol/protocolVersion` in `_meta` on any transport) — never on
-transport, URL, or configuration. A Legacy request never touches any Modern-era
+on the request body: a `io.modelcontextprotocol/protocolVersion` `_meta` claim
+naming a Modern revision selects Modern (on any transport); anything else,
+including `initialize`, is Legacy. The `MCP-Protocol-Version` header is only a
+cross-check (a Modern header with no `_meta` claim is refused as a malformed
+Modern request), and `Mcp-Method`/`Mcp-Name` are never an era signal — Legacy
+clients such as mcp-remote mirror them on every request too. Detection never
+looks at the transport, URL, or configuration. A Legacy request never touches any Modern-era
 code path, and vice versa.
 
 A `Client` detects which era its server speaks the first time `Initialize` runs:
@@ -50,7 +54,7 @@ case: legacy clients, minimal functionality requirements.
 
 ### 2025-03-26 and Later (Enhanced)
 
-Adds `tools/listChanged`, `resources/subscribe`, `resources/listChanged`. Use
+Adds the `listChanged` capability flags and `notifications/*/list_changed`. Use
 case: Legacy clients that want change notifications over the `GET` SSE stream.
 
 ### 2025-11-25 (Latest Legacy)

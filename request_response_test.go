@@ -103,7 +103,7 @@ func TestToolResponseHelpers(t *testing.T) {
 	}
 
 	link := NewToolResponseResourceLink("https://x", "open")
-	if link.Content[0].Type != "resource_link" || link.Content[0].Resource.URI != "https://x" {
+	if link.Content[0].Type != "resource_link" || link.Content[0].URI != "https://x" || link.Content[0].Name != "open" {
 		t.Fatal("link")
 	}
 
@@ -153,33 +153,32 @@ func TestNewToolResponseStructured_MarshalError(t *testing.T) {
 	}
 }
 
-// TestNewToolResponseStructured_NonObjectRejected covers the MCP spec's
-// requirement that structuredContent be a JSON object: arrays, strings, and
-// other scalar values must be rejected rather than silently sent on the wire
-// as a non-compliant structuredContent.
-func TestNewToolResponseStructured_NonObjectRejected(t *testing.T) {
+// TestNewToolResponseStructured_AnyValue covers that structuredContent may
+// be any JSON value (2026-07-28), and that the Legacy path strips a
+// non-object value since those revisions define it as an object.
+func TestNewToolResponseStructured_AnyValue(t *testing.T) {
 	cases := []struct {
-		name string
-		data any
-		want string
+		name   string
+		data   any
+		legacy bool // kept on the Legacy path?
 	}{
-		{"slice", []int{1, 2, 3}, "an array"},
-		{"string", "hello", "a string"},
-		{"number", 42, "a number"},
-		{"bool", true, "a boolean"},
-		{"nil", nil, "null"},
+		{"slice", []int{1, 2, 3}, false},
+		{"string", "hello", false},
+		{"number", 42, false},
+		{"bool", true, false},
+		{"object", map[string]any{"a": 1}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := NewToolResponseStructured(tc.data)
-			if resp.StructuredContent != nil {
-				t.Errorf("StructuredContent = %v, want nil for non-object input", resp.StructuredContent)
+			if resp.IsError || resp.StructuredContent == nil {
+				t.Fatalf("resp = %+v, want structuredContent kept", resp)
 			}
 			if len(resp.Content) != 1 || resp.Content[0].Type != "text" {
-				t.Fatalf("expected a single text error block, got %+v", resp.Content)
+				t.Fatalf("expected a single text block, got %+v", resp.Content)
 			}
-			if !strings.Contains(resp.Content[0].Text, tc.want) {
-				t.Errorf("Text = %q, want it to mention %q", resp.Content[0].Text, tc.want)
+			if kept := legacyStructuredContent(resp.StructuredContent) != nil; kept != tc.legacy {
+				t.Errorf("legacyStructuredContent kept = %v, want %v", kept, tc.legacy)
 			}
 		})
 	}

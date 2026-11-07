@@ -138,11 +138,11 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		req.ID = ""
 	}
 
-	// Modern-era (protocol revision 2026-07-28+) requests are detected by a
-	// signal only a Modern client sends (the Mcp-Method header, or
-	// io.modelcontextprotocol/protocolVersion in _meta) and are handled by a
-	// dedicated stateless path in modern.go. A request with neither signal
-	// falls through to every line below completely unchanged.
+	// Modern-era (protocol revision 2026-07-28+) requests are detected from
+	// the body's io.modelcontextprotocol/protocolVersion _meta claim (or a
+	// Modern MCP-Protocol-Version header, see isModernRequest) and are
+	// handled by a dedicated stateless path in modern.go. A request with
+	// neither signal falls through to every line below completely unchanged.
 	if isModernRequest(r, &req) {
 		s.handleModernRequest(w, r, &req)
 		return
@@ -493,25 +493,12 @@ func (s *Server) handleToolsCall(w http.ResponseWriter, r *http.Request, req *MC
 	}
 
 	response, err := s.CallTool(r.Context(), params.Name, params.Arguments)
-	if err != nil {
-		// Check if it's a ToolError with specific MCP error code
-		if toolErr, ok := err.(*ToolError); ok {
-			s.sendMCPError(w, req.ID, toolErr.Code, toolErr.Message, toolErr.Data)
-		} else if err == ErrUnknownTool && s.hasDiscoverableToolsNow(r.Context()) {
-			// The caller guessed a tool name directly instead of going through
-			// tool_search first; point it at discovery instead of a dead end.
-			s.sendMCPError(w, req.ID, ErrorCodeInternalError, fmt.Sprintf("Tool execution failed: unknown tool %q. Use %s to discover available tools, then %s to invoke them.", params.Name, ToolSearchName, ExecuteToolName), nil)
-		} else {
-			s.sendMCPError(w, req.ID, ErrorCodeInternalError, fmt.Sprintf("Tool execution failed: %v", err), nil)
-		}
+	result, wireErr := s.toolsCallResult(r.Context(), params.Name, response, err, !isModernRequest(r, req))
+	if wireErr != nil {
+		s.sendMCPError(w, req.ID, wireErr.Code, wireErr.Message, wireErr.Data)
 		return
 	}
-
-	s.sendMCPResponse(w, req.ID, ToolResult{
-		Content:           response.Content,
-		StructuredContent: response.StructuredContent,
-		IsError:           false,
-	})
+	s.sendMCPResponse(w, req.ID, result)
 }
 
 // checkSession validates the MCP-Session-Id header when session management

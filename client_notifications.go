@@ -226,7 +226,7 @@ func passthroughMethod(method string) (string, bool) { return method, true }
 // relevant cache, fires the user callback, then the internal propagation hook.
 // Shared by the HTTP SSE reader and the stdio peer handlers.
 func (c *Client) handleNotification(method string, params any) {
-	switch method {
+	switch canonicalNotificationMethod(method) {
 	case NotificationToolsChanged:
 		c.mu.Lock()
 		c.cachedTools = nil

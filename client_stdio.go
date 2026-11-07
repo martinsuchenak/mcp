@@ -234,7 +234,11 @@ func registerPeerNotificationHandlers(peer *jsonrpc.Peer, c *Client) {
 			return nil, nil
 		}
 	}
-	peer.Handle(NotificationToolsChanged, mk(NotificationToolsChanged))
-	peer.Handle(NotificationResourcesChanged, mk(NotificationResourcesChanged))
-	peer.Handle(NotificationPromptsChanged, mk(NotificationPromptsChanged))
+	for _, method := range []string{
+		NotificationToolsChanged, NotificationResourcesChanged, NotificationPromptsChanged,
+		// Servers built with pre-v0.34 releases of this library.
+		legacyNotificationToolsChanged, legacyNotificationResourcesChanged, legacyNotificationPromptsChanged,
+	} {
+		peer.Handle(method, mk(method))
+	}
 }

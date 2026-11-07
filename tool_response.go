@@ -8,16 +8,31 @@ import (
 	"github.com/paularlott/mcp/toon"
 )
 
-// ToolResponse represents the response from a tool
+// ToolResponse represents the response from a tool.
+//
+// IsError marks a tool execution error (an API failure, a business-rule or
+// input-validation failure): per the spec it is reported inside the result,
+// with Content explaining what went wrong so the model can self-correct,
+// not as a JSON-RPC protocol error. A handler that returns a plain Go error
+// is converted to this shape; return a *ToolError only for a genuine
+// protocol error (invalid params, internal failure).
 type ToolResponse struct {
 	Content           []ToolContent `json:"content"`
 	StructuredContent any           `json:"structuredContent,omitempty"`
+	IsError           bool          `json:"isError,omitempty"`
+}
+
+// NewToolResponseError builds a tool execution error result: text explains
+// the failure and isError is set, as the spec's tool error model requires.
+func NewToolResponseError(text string) *ToolResponse {
+	return &ToolResponse{Content: []ToolContent{{Type: "text", Text: text}}, IsError: true}
 }
 
 func NewToolResponseMulti(responses ...*ToolResponse) *ToolResponse {
 	var allContent []ToolContent
 	var structuredContent any
 
+	isError := false
 	for _, resp := range responses {
 		if resp.Content != nil {
 			allContent = append(allContent, resp.Content...)
@@ -25,11 +40,13 @@ func NewToolResponseMulti(responses ...*ToolResponse) *ToolResponse {
 		if resp.StructuredContent != nil {
 			structuredContent = resp.StructuredContent
 		}
+		isError = isError || resp.IsError
 	}
 
 	return &ToolResponse{
 		Content:           allContent,
 		StructuredContent: structuredContent,
+		IsError:           isError,
 	}
 }
 
@@ -84,29 +101,47 @@ func NewToolResponseResource(uri, text, mimeType string) *ToolResponse {
 	return &ToolResponse{Content: []ToolContent{{Type: "resource", Resource: &ResourceContent{URI: uri, Text: text, MimeType: mimeType}}}}
 }
 
-func NewToolResponseResourceLink(uri, text string) *ToolResponse {
-	return &ToolResponse{Content: []ToolContent{{Type: "resource_link", Resource: &ResourceContent{URI: uri, Text: text}}}}
+// NewToolResponseResourceLink returns a link to a resource the client may
+// read or subscribe to, as the spec's resource_link block: the resource's
+// uri and name at the top level. Use NewToolResponseResource to embed the
+// resource's contents instead.
+func NewToolResponseResourceLink(uri, name string) *ToolResponse {
+	return &ToolResponse{Content: []ToolContent{{Type: "resource_link", URI: uri, Name: name}}}
 }
 
-// NewToolResponseStructured builds a structured tool result: data (which
-// must marshal to a JSON object, per the MCP spec's structuredContent
-// requirement — a non-object value produces an error-text result instead)
-// is set as StructuredContent, and — per that spec's backwards compatibility
-// guidance ("a tool that returns structured content SHOULD also return the
+// NewToolResponseStructured builds a structured tool result: data is set as
+// StructuredContent, and — per the spec's backwards compatibility guidance
+// ("a tool that returns structured content SHOULD also return the
 // serialized JSON in a TextContent block") — the same JSON is also included
 // as a text content block, for clients that don't read structuredContent.
+//
+// Any JSON value is accepted: 2026-07-28 allows any value in
+// structuredContent, while the Legacy revisions require an object, so the
+// Legacy transport path drops a non-object value from the result (the text
+// block still carries it). Data that cannot be marshaled is reported as a
+// tool execution error.
 func NewToolResponseStructured(data any) *ToolResponse {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		return &ToolResponse{Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("Error marshaling data: %v", err)}}}
-	}
-	if !isJSONObject(jsonData) {
-		return &ToolResponse{Content: []ToolContent{{Type: "text", Text: "Error: structuredContent must marshal to a JSON object, not " + jsonValueKind(jsonData)}}}
+		return NewToolResponseError(fmt.Sprintf("Error marshaling data: %v", err))
 	}
 	return &ToolResponse{
 		Content:           []ToolContent{{Type: "text", Text: string(jsonData)}},
 		StructuredContent: data,
 	}
+}
+
+// legacyStructuredContent returns v when it marshals to a JSON object, else
+// nil: Legacy revisions (through 2025-11-25) define structuredContent as an
+// object, so a Legacy client is not sent anything else.
+func legacyStructuredContent(v any) any {
+	if v == nil {
+		return nil
+	}
+	if jsonData, err := json.Marshal(v); err != nil || !isJSONObject(jsonData) {
+		return nil
+	}
+	return v
 }
 
 // isJSONObject reports whether marshaled JSON is an object ("{...}"), per the

@@ -492,7 +492,7 @@ func TestClientDoesNotStartReaderWithoutOptIn(t *testing.T) {
 func TestSSESinkDropsWhenFull(t *testing.T) {
 	sink := newSSESink(2) // tiny buffer
 	for i := 0; i < 100; i++ {
-		sink.send("notifications/tools/listChanged", nil) // must never block
+		sink.send(NotificationToolsChanged, nil) // must never block
 	}
 	// Only the last ~2 are retained; the rest dropped. We just need non-blocking.
 	if cap(sink.ch) != 2 {
@@ -575,7 +575,7 @@ func TestSSENotificationWireFormatOmitsID(t *testing.T) {
 		t.Fatalf("read SSE: %v", err)
 	}
 	line := string(buf[:n])
-	if !strings.Contains(line, `"method":"notifications/tools/listChanged"`) {
+	if !strings.Contains(line, `"method":"notifications/tools/list_changed"`) {
 		t.Fatalf("expected listChanged notification, got: %s", line)
 	}
 	if strings.Contains(line, `"id"`) {

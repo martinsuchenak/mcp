@@ -429,7 +429,7 @@ func (s *Server) handleResourcesRead(w http.ResponseWriter, r *http.Request, req
 
 	resp, err := s.ReadResource(readCtx, params.URI)
 	if err != nil {
-		e := resourcesReadWireError(params.URI, err)
+		e := resourcesReadWireError(params.URI, err, !isModernRequest(r, req))
 		s.sendMCPError(w, req.ID, e.Code, e.Message, e.Data)
 		return
 	}

@@ -487,26 +487,66 @@ func (s *Server) CallTool(ctx context.Context, name string, args map[string]any)
 // toolsCallWireError maps a tools/call failure to its wire shape
 // (code/message/data). Shared by the HTTP and stdio handlers so both
 // transports answer identically, including the tool_search hint.
+// An unknown tool is a protocol error with the spec's own example code
+// (-32602, "Unknown tool: ..."); see toolsCallResult for everything else.
 func (s *Server) toolsCallWireError(ctx context.Context, name string, err error) *MCPError {
 	if toolErr, ok := err.(*ToolError); ok {
 		return &MCPError{Code: toolErr.Code, Message: toolErr.Message, Data: toolErr.Data}
 	}
-	if err == ErrUnknownTool && s.hasDiscoverableToolsNow(ctx) {
-		return &MCPError{Code: ErrorCodeInternalError, Message: fmt.Sprintf("Tool execution failed: unknown tool %q. Use %s to discover available tools, then %s to invoke them.", name, ToolSearchName, ExecuteToolName)}
+	if errors.Is(err, ErrUnknownTool) {
+		msg := fmt.Sprintf("Unknown tool: %s", name)
+		if s.hasDiscoverableToolsNow(ctx) {
+			msg += fmt.Sprintf(". Use %s to discover available tools, then %s to invoke them.", ToolSearchName, ExecuteToolName)
+		}
+		return &MCPError{Code: ErrorCodeInvalidParams, Message: msg, Data: map[string]any{"name": name}}
 	}
 	return &MCPError{Code: ErrorCodeInternalError, Message: fmt.Sprintf("Tool execution failed: %v", err)}
+}
+
+// toolsCallResult turns a handler's outcome into the tools/call result the
+// spec defines, shared by the HTTP and stdio handlers. A *ToolError and an
+// unknown tool stay protocol errors (wireErr); any other error the handler
+// returned is a tool execution error and is reported inside the result with
+// isError set, so the model sees the text and can self-correct. legacy
+// strips a non-object structuredContent, which only 2026-07-28 allows.
+func (s *Server) toolsCallResult(ctx context.Context, name string, response *ToolResponse, err error, legacy bool) (result *ToolResult, wireErr *MCPError) {
+	if err != nil {
+		var toolErr *ToolError
+		if errors.As(err, &toolErr) || errors.Is(err, ErrUnknownTool) {
+			return nil, s.toolsCallWireError(ctx, name, err)
+		}
+		response = NewToolResponseError(err.Error())
+	}
+	if response == nil {
+		response = &ToolResponse{}
+	}
+	content := response.Content
+	if content == nil {
+		content = []ToolContent{}
+	}
+	structured := response.StructuredContent
+	if legacy {
+		structured = legacyStructuredContent(structured)
+	}
+	return &ToolResult{Content: content, StructuredContent: structured, IsError: response.IsError}, nil
 }
 
 // resourcesReadWireError maps a resources/read failure to its wire shape,
 // shared by the HTTP and stdio handlers. A wrapped ErrUnknownResource
 // (remotes failed outright, not just missed) keeps its diagnosis in data.details.
-func resourcesReadWireError(uri string, err error) *MCPError {
+// A Legacy client gets the Legacy spec's resource-not-found code (-32002);
+// 2026-07-28 withdrew that code and requires -32602 instead (legacy=false).
+func resourcesReadWireError(uri string, err error, legacy bool) *MCPError {
 	if errors.Is(err, ErrUnknownResource) {
 		data := map[string]any{"uri": uri}
 		if err != ErrUnknownResource {
 			data["details"] = err.Error()
 		}
-		return &MCPError{Code: ErrorCodeInvalidParams, Message: "Resource not found", Data: data}
+		code := ErrorCodeInvalidParams
+		if legacy {
+			code = ErrorCodeResourceNotFound
+		}
+		return &MCPError{Code: code, Message: "Resource not found", Data: data}
 	}
 	if toolErr, ok := err.(*ToolError); ok {
 		return &MCPError{Code: toolErr.Code, Message: toolErr.Message, Data: toolErr.Data}

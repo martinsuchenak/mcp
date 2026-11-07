@@ -6,9 +6,9 @@ The three notification methods:
 
 | Method | Fired when |
 | --- | --- |
-| `notifications/tools/listChanged` | The tool set changes |
-| `notifications/resources/listChanged` | The resource/template set changes |
-| `notifications/prompts/listChanged` | The prompt set changes |
+| `notifications/tools/list_changed` | The tool set changes |
+| `notifications/resources/list_changed` | The resource/template set changes |
+| `notifications/prompts/list_changed` | The prompt set changes |
 
 ## Server: automatic emission
 
@@ -69,7 +69,7 @@ client.OnToolsChanged(func() { log.Println("tools changed") })
 
 ## Federation: propagation
 
-When a server re-exports a remote MCP server (via `RegisterRemoteServer`), it can propagate that remote's changes to its own clients. The propagation hook is installed automatically; it fires when the remote client receives a `notifications/tools/listChanged` and is opted in to notifications:
+When a server re-exports a remote MCP server (via `RegisterRemoteServer`), it can propagate that remote's changes to its own clients. The propagation hook is installed automatically; it fires when the remote client receives a `notifications/tools/list_changed` and is opted in to notifications:
 
 ```go
 upstreamClient := mcp.NewClient(upstreamURL, auth, "")
@@ -80,9 +80,9 @@ server.RegisterRemoteServer(upstreamClient)
 Now a tool added upstream flows through automatically:
 
 ```
-upstream adds a tool  ->  emits tools/listChanged
+upstream adds a tool  ->  emits tools/list_changed
                      ->  federator's client receives it, refreshes its merged cache
-                     ->  federator re-emits tools/listChanged
+                     ->  federator re-emits tools/list_changed
                      ->  federator's clients re-fetch and see the new tool
 ```
 

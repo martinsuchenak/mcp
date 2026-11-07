@@ -70,12 +70,12 @@ func TestIsModernRequest(t *testing.T) {
 		}
 	})
 
-	t.Run("Mcp-Method header alone is a modern signal", func(t *testing.T) {
+	t.Run("Mcp-Method header alone is not a modern signal", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
 		r.Header.Set(headerMcpMethod, "tools/list")
 		req := &MCPRequest{Method: "tools/list", Params: map[string]any{}}
-		if !isModernRequest(r, req) {
-			t.Fatal("expected true when Mcp-Method header is present")
+		if isModernRequest(r, req) {
+			t.Fatal("expected false: Mcp-Method is mirrored by Legacy clients too (mcp-remote)")
 		}
 	})
 
@@ -89,13 +89,45 @@ func TestIsModernRequest(t *testing.T) {
 		}
 	})
 
-	t.Run("Mcp-Method with the Modern MCP-Protocol-Version is modern", func(t *testing.T) {
+	t.Run("initialize with Mcp-Method and no version header is legacy", func(t *testing.T) {
+		// mcp-remote's default (legacy) mode forwards initialize with
+		// Mcp-Method: initialize and no MCP-Protocol-Version header (the
+		// version is only known once initialize has been answered).
+		r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		r.Header.Set(headerMcpMethod, "initialize")
+		req := &MCPRequest{Method: "initialize", Params: map[string]any{"protocolVersion": "2025-11-25"}}
+		if isModernRequest(r, req) {
+			t.Fatal("expected false for a Legacy initialize")
+		}
+	})
+
+	t.Run("Modern MCP-Protocol-Version header without a _meta claim is modern (so it is refused)", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
 		r.Header.Set(headerMcpMethod, "tools/list")
 		r.Header.Set(headerProtocolVersion, MCPProtocolVersionModern)
 		req := &MCPRequest{Method: "tools/list", Params: map[string]any{}}
 		if !isModernRequest(r, req) {
-			t.Fatal("expected true for a Modern client")
+			t.Fatal("expected true: a Modern header is a Modern request, even a malformed one")
+		}
+	})
+
+	t.Run("_meta claim naming a Legacy revision is legacy", func(t *testing.T) {
+		req := &MCPRequest{
+			Method: "tools/list",
+			Params: map[string]any{"_meta": map[string]any{metaKeyProtocolVersion: "2025-11-25"}},
+		}
+		if isModernRequest(nil, req) {
+			t.Fatal("expected false: the claim classifies into the era of the named revision")
+		}
+	})
+
+	t.Run("_meta claim naming an unknown revision is modern (gets UnsupportedProtocolVersion)", func(t *testing.T) {
+		req := &MCPRequest{
+			Method: "tools/list",
+			Params: map[string]any{"_meta": map[string]any{metaKeyProtocolVersion: "2099-01-01"}},
+		}
+		if !isModernRequest(nil, req) {
+			t.Fatal("expected true")
 		}
 	})
 
@@ -126,6 +158,9 @@ func TestLegacyClientWithMcpMethodHeader(t *testing.T) {
 		method string
 		params map[string]any
 	}{
+		// initialize goes out before the version is negotiated, so it
+		// carries Mcp-Method but no MCP-Protocol-Version header at all.
+		{"initialize", map[string]any{"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "mcp-remote", "version": "1"}}},
 		{"tools/list", map[string]any{}},
 		{"tools/call", map[string]any{"name": "echo", "arguments": map[string]any{}}},
 	} {
@@ -133,7 +168,9 @@ func TestLegacyClientWithMcpMethodHeader(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, srv.URL, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set(headerProtocolVersion, "2025-11-25")
+		if tc.method != "initialize" {
+			req.Header.Set(headerProtocolVersion, "2025-11-25")
+		}
 		req.Header.Set(headerMcpMethod, tc.method)
 		if name, ok := tc.params["name"].(string); ok {
 			req.Header.Set(headerMcpName, name)
@@ -1134,9 +1171,14 @@ func TestParamsParseFailure_EraAwareStatus(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name+"/modern gets 400", func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
-			r.Header.Set(headerMcpMethod, tc.method) // the only signal isModernRequest needs here
+			r.Header.Set(headerMcpMethod, tc.method)
 			capture := newModernResponseCapture()
-			req := &MCPRequest{JSONRPC: "2.0", ID: "x", Method: tc.method, Params: garbledParams}
+			// The body's _meta claim is what classifies this as Modern.
+			modernParams := map[string]any{"_meta": map[string]any{metaKeyProtocolVersion: MCPProtocolVersionModern}}
+			for k, v := range garbledParams {
+				modernParams[k] = v
+			}
+			req := &MCPRequest{JSONRPC: "2.0", ID: "x", Method: tc.method, Params: modernParams}
 			tc.call(capture, r, req)
 			if capture.status != http.StatusBadRequest {
 				t.Errorf("status = %d, want 400", capture.status)

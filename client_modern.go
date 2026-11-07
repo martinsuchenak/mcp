@@ -325,28 +325,12 @@ func (c *Client) connectModernSubscription(ctx context.Context) (*http.Response,
 	return resp, translateModernNotification, err
 }
 
-// translateModernNotification reverses modernNotificationMethodName for the
-// subscription reader, and drops the subscription acknowledgement (it is a
-// handshake reply, not a change event).
+// translateModernNotification drops the subscription acknowledgement for the
+// subscription reader (it is a handshake reply, not a change event); the
+// list-changed method names are spelled the same in both eras.
 func translateModernNotification(modernMethod string) (string, bool) {
 	if modernMethod == "notifications/subscriptions/acknowledged" {
 		return "", false
 	}
-	return legacyNotificationMethodName(modernMethod), true
-}
-
-// legacyNotificationMethodName reverses modernNotificationMethodName, so the
-// Modern subscription reader can hand handleNotification the same method
-// constants the Legacy SSE reader always has.
-func legacyNotificationMethodName(modernMethod string) string {
-	switch modernMethod {
-	case "notifications/tools/list_changed":
-		return NotificationToolsChanged
-	case "notifications/resources/list_changed":
-		return NotificationResourcesChanged
-	case "notifications/prompts/list_changed":
-		return NotificationPromptsChanged
-	default:
-		return modernMethod
-	}
+	return modernMethod, true
 }

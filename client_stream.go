@@ -171,7 +171,7 @@ func (c *Client) consumeResponseStream(ctx context.Context, rd *sseReader, wantI
 		case env.Method != "":
 			method := env.Method
 			if c.era == eraModern {
-				method = legacyNotificationMethodName(method)
+				method = canonicalNotificationMethod(method)
 			}
 			notifier.push(method, env.Params)
 		case env.hasID() && reflect.DeepEqual(normalizeJSONRPCRawID(env.ID), wantID),

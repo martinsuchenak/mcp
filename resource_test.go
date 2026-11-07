@@ -238,9 +238,10 @@ func TestResourceTemplateExtractsMultipleVars(t *testing.T) {
 func TestResourceReadUnknownHTTP(t *testing.T) {
 	s := staticResourceServer(t)
 
+	// A Legacy client gets the Legacy spec's -32002 resource-not-found code.
 	err := doMCPErr(t, s, "resources/read", map[string]any{"uri": "nope://missing"})
-	if err == nil || err.Code != ErrorCodeInvalidParams {
-		t.Fatalf("expected invalid params error, got %+v", err)
+	if err == nil || err.Code != ErrorCodeResourceNotFound {
+		t.Fatalf("expected resource not found (-32002), got %+v", err)
 	}
 }
 
