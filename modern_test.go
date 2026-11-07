@@ -296,45 +296,6 @@ func TestServerDiscoverStdio(t *testing.T) {
 	}
 }
 
-// TestStdioSubscriptionsListenNotSupported pins down the deliberate scope
-// decision documented on modern.go's package comment: stdio doesn't
-// implement subscriptions/listen, and a client calling it must get a clear,
-// standard "Method not found" rather than silence or a partial/incorrect
-// implementation.
-func TestStdioSubscriptionsListenNotSupported(t *testing.T) {
-	s := NewServer("stdio-no-subscriptions", "1")
-
-	clientReader, serverWriter := io.Pipe()
-	serverReader, clientWriter := io.Pipe()
-	serveDone := make(chan struct{})
-	go func() {
-		defer close(serveDone)
-		_ = s.ServeStream(context.Background(), serverReader, serverWriter)
-	}()
-	transport := jsonrpc.NewStreamTransport(clientReader, clientWriter)
-	rpc := jsonrpc.NewClient(transport)
-	defer func() {
-		clientWriter.Close()
-		<-serveDone
-		serverWriter.Close()
-	}()
-
-	var result map[string]any
-	err := rpc.Call(context.Background(), "subscriptions/listen", map[string]any{
-		"notifications": map[string]any{"toolsListChanged": true},
-	}, &result)
-	if err == nil {
-		t.Fatalf("expected an error, got result: %#v", result)
-	}
-	rpcErr, ok := err.(*jsonrpc.Error)
-	if !ok {
-		t.Fatalf("expected a *jsonrpc.Error, got %T: %v", err, err)
-	}
-	if rpcErr.Code != ErrorCodeMethodNotFound {
-		t.Errorf("error code = %d, want MethodNotFound (%d): %v", rpcErr.Code, ErrorCodeMethodNotFound, rpcErr)
-	}
-}
-
 // TestStdioModernRequest_ResultShape closes the same gap the HTTP path had
 // (a real client's strict schema validation rejects a tools/list result
 // missing ttlMs): a stdio request whose raw params carry

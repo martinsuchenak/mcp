@@ -154,7 +154,7 @@ Prompts are not cached on the client — each call performs a fresh request.
 
 ## Capabilities
 
-The server always advertises the `prompts` capability in `initialize` (with `listChanged` set to `false` — list-change notifications are not yet implemented).
+The server always advertises the `prompts` capability in `initialize` (`listChanged` is `true` from 2025-03-26 on — see the [Notifications guide](notifications.md)).
 
 ## See Also
 

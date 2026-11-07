@@ -60,11 +60,18 @@ case: legacy clients, minimal functionality requirements.
 Adds the `listChanged` capability flags and `notifications/*/list_changed`. Use
 case: Legacy clients that want change notifications over the `GET` SSE stream.
 
-### 2025-11-25 (Latest Legacy)
+### 2025-06-18 and 2025-11-25 (Latest Legacy)
 
-Adds JWT-based stateless session management and `MCP-Protocol-Version` header
-validation, on top of every earlier feature. Use case: production Legacy
-deployments needing session tracking.
+2025-06-18 requires the `MCP-Protocol-Version` header on every request after
+`initialize` (the server assumes 2025-03-26 when it is absent, as the spec
+allows) and removes JSON-RPC batching; 2025-11-25 adds `title`, icons and
+tool annotations on the primitives. Session management (`MCP-Session-Id`,
+including the JWT manager) is available to every Legacy revision. Use case:
+production Legacy deployments.
+
+Note: 2024-11-05 is served over Streamable HTTP and stdio. The original
+HTTP+SSE transport of that revision (a `GET` that announces an `endpoint`
+event) is not implemented, on either the server or the client.
 
 ## Modern (2026-07-28)
 

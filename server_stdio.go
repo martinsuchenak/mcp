@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/paularlott/jsonrpc"
 )
@@ -73,18 +75,30 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer, o
 	// A shared write mutex guards out so responses and notifications serialize.
 	var writeMu sync.Mutex
 	var wg sync.WaitGroup
+	write := func(line []byte) {
+		writeMu.Lock()
+		_, _ = out.Write(append(line, '\n'))
+		writeMu.Unlock()
+	}
 
-	// The sink is non-blocking: it queues notifications to a buffered channel and
-	// a drainer writes them under writeMu. This keeps emit (which can run under
-	// s.mu from RegisterTool) from ever blocking on a slow/stuck client.
+	// Legacy-era change notifications are pushed to this stream only once
+	// its client has completed a Legacy initialize that advertised
+	// listChanged (2025-03-26 and later): a client is only sent the
+	// capabilities it negotiated, and a Modern (2026-07-28) client gets no
+	// unsolicited notifications at all — it opens subscriptions/listen.
+	// The sink is non-blocking: it queues notifications to a buffered channel
+	// and a drainer writes them under writeMu, so emit (which can run under
+	// s.mu from RegisterTool) never blocks on a slow/stuck client.
 	sink := newStreamNotifySink(out, &writeMu)
 	subID := s.notifications.subscribe(sink)
 	defer s.notifications.unsubscribe(subID)
 	defer sink.stop()
 
-	// Close the reader on ctx cancellation so decoder.Decode unblocks. Without
-	// this, Ctrl+C cancels the context but the read loop is stuck in Decode and
-	// the process hangs. os.Stdin (the common case) is an io.Closer.
+	stream := &stdioStream{write: write, inflight: map[string]*stdioInflight{}}
+
+	// Close the reader on ctx cancellation so the read unblocks. Without
+	// this, Ctrl+C cancels the context but the read loop is stuck and the
+	// process hangs. os.Stdin (the common case) is an io.Closer.
 	if closer, ok := in.(io.Closer); ok {
 		go func() {
 			<-ctx.Done()
@@ -92,11 +106,19 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer, o
 		}()
 	}
 
-	decoder := json.NewDecoder(in)
+	// Newline framing, as the stdio transport defines it: one message per
+	// line. A line that is not valid JSON is answered with a parse error
+	// (-32700) and the stream carries on, rather than the whole server
+	// stopping at the first malformed byte.
+	reader := bufio.NewReader(in)
 	for {
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
-			wg.Wait() // let in-flight handlers flush their responses
+		line, err := reader.ReadBytes('\n')
+		if msg := bytes.TrimSpace(line); len(msg) > 0 {
+			s.serveStdioMessage(ctx, srv, stream, sink, &wg, msg)
+		}
+		if err != nil {
+			stream.cancelAll() // nothing can be answered on a closed stream
+			wg.Wait()          // let in-flight handlers finish
 			if ctx.Err() != nil {
 				return nil // context cancelled (reader closed) — clean shutdown
 			}
@@ -105,19 +127,230 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer, o
 			}
 			return err
 		}
-		if len(bytes.TrimSpace(raw)) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(msg json.RawMessage) {
-			defer wg.Done()
-			if resp, hasResp := srv.HandleMessage(ctx, msg); hasResp {
-				writeMu.Lock()
-				_, _ = out.Write(append(resp, '\n'))
-				writeMu.Unlock()
-			}
-		}(raw)
 	}
+}
+
+// stdioStream is the per-connection state the read loop keeps: the requests
+// still being handled (so notifications/cancelled can reach them) and the
+// writer handlers use for messages of their own (subscriptions/listen).
+type stdioStream struct {
+	write    func(line []byte)
+	mu       sync.Mutex
+	inflight map[string]*stdioInflight
+}
+
+type stdioInflight struct {
+	cancel    context.CancelFunc
+	cancelled bool
+}
+
+func (st *stdioStream) track(key string, cancel context.CancelFunc) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.inflight[key] = &stdioInflight{cancel: cancel}
+}
+
+// untrack forgets a finished request and reports whether the client had
+// cancelled it (in which case its response must not be sent).
+func (st *stdioStream) untrack(key string) (cancelled bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if e := st.inflight[key]; e != nil {
+		cancelled = e.cancelled
+		e.cancel()
+		delete(st.inflight, key)
+	}
+	return cancelled
+}
+
+func (st *stdioStream) cancel(key string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if e := st.inflight[key]; e != nil {
+		e.cancelled = true
+		e.cancel()
+	}
+}
+
+func (st *stdioStream) cancelAll() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, e := range st.inflight {
+		e.cancel()
+	}
+}
+
+// stdioHead is the part of an inbound line the read loop itself needs.
+type stdioHead struct {
+	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+// stdioIDKey normalises a JSON-RPC id for inflight tracking.
+func stdioIDKey(raw json.RawMessage) string {
+	var buf bytes.Buffer
+	if json.Compact(&buf, raw) != nil {
+		return string(raw)
+	}
+	return buf.String()
+}
+
+// stdioRequestKey carries a request's id and the stream writer to handlers
+// that must write messages before their result (subscriptions/listen).
+type stdioRequestKey struct{}
+
+type stdioRequest struct {
+	id    any
+	write func(line []byte)
+}
+
+// serveStdioMessage dispatches one inbound line. Requests run concurrently,
+// each under a cancellable context that notifications/cancelled reaches via
+// its id (the spec: a cancelled request's work stops and no response is sent).
+func (s *Server) serveStdioMessage(ctx context.Context, srv *jsonrpc.Server, stream *stdioStream, sink *streamNotifySink, wg *sync.WaitGroup, msg []byte) {
+	var head stdioHead
+	if msg[0] == '{' {
+		_ = json.Unmarshal(msg, &head)
+	}
+
+	if head.Method == "notifications/cancelled" && len(head.ID) == 0 {
+		var params struct {
+			RequestID json.RawMessage `json:"requestId"`
+		}
+		if json.Unmarshal(head.Params, &params) == nil && len(params.RequestID) > 0 {
+			stream.cancel(stdioIDKey(params.RequestID))
+		}
+		return
+	}
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	key := ""
+	if len(head.ID) > 0 && string(bytes.TrimSpace(head.ID)) != "null" && head.Method != "" {
+		key = stdioIDKey(head.ID)
+		stream.track(key, cancel)
+		if id, ok := decodeJSONRPCID(head.ID); ok {
+			reqCtx = context.WithValue(reqCtx, stdioRequestKey{}, &stdioRequest{id: id, write: stream.write})
+		}
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		resp, hasResp := srv.HandleMessage(reqCtx, msg)
+		if key != "" && stream.untrack(key) {
+			return // cancelled by the client: no response
+		}
+		if hasResp {
+			if head.Method == "initialize" {
+				// Gate before the response goes out, so a notification
+				// emitted right after the client reads it is delivered.
+				sink.setEnabled(legacyInitializeAdvertisesListChanged(resp))
+			}
+			stream.write(resp)
+		}
+	}()
+}
+
+// legacyInitializeAdvertisesListChanged reports whether an initialize
+// response negotiated a revision whose capabilities carry listChanged, i.e.
+// whether list-changed notifications may be pushed to that client.
+func legacyInitializeAdvertisesListChanged(resp []byte) bool {
+	var out struct {
+		Result *struct {
+			Capabilities struct {
+				Tools map[string]any `json:"tools"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(resp, &out) != nil || out.Result == nil {
+		return false
+	}
+	v, _ := out.Result.Capabilities.Tools["listChanged"].(bool)
+	return v
+}
+
+// stdioSubscriptionsListen serves subscriptions/listen over stdio (Modern
+// era): it acknowledges with the honoured subset of the filter, then writes
+// each matching list-changed notification tagged with the subscription id
+// (the request's own id), until the client cancels the request
+// (notifications/cancelled, after which nothing more is sent) or the server
+// shuts down, when the request is answered with a completion result — the
+// spec's graceful closure. wrapStdioModern validates _meta and shapes that
+// result like any other.
+func (s *Server) stdioSubscriptionsListen(ctx context.Context, params json.RawMessage) (any, error) {
+	req, _ := ctx.Value(stdioRequestKey{}).(*stdioRequest)
+	if req == nil {
+		return nil, jsonrpc.NewError(ErrorCodeInternalError, "subscriptions/listen needs a request id", nil)
+	}
+	wanted, acked, errDetails := parseListenFilter(params)
+	if errDetails != "" {
+		return nil, jsonrpc.NewError(ErrorCodeInvalidParams, "Invalid params", map[string]any{"details": errDetails})
+	}
+
+	sink := newModernSubscriptionSink(64, wanted)
+	subID := s.notifications.subscribe(sink)
+	defer s.notifications.unsubscribe(subID)
+
+	meta := map[string]any{metaKeySubscriptionID: req.id}
+	ack, _ := json.Marshal(MCPNotification{
+		JSONRPC: "2.0",
+		Method:  "notifications/subscriptions/acknowledged",
+		Params:  map[string]any{"_meta": meta, "notifications": acked},
+	})
+	req.write(ack)
+
+	for {
+		select {
+		case ev := <-sink.ch:
+			line, err := json.Marshal(MCPNotification{JSONRPC: "2.0", Method: ev.method, Params: map[string]any{"_meta": meta}})
+			if err == nil {
+				req.write(line)
+			}
+		case <-ctx.Done():
+			return nil, jsonrpc.NewError(ErrorCodeInternalError, "cancelled", nil) // never sent: the request was cancelled
+		case <-s.shutdownCh:
+			return map[string]any{"_meta": meta}, nil
+		}
+	}
+}
+
+// parseListenFilter reads a subscriptions/listen params object: notifications
+// must be an object (every field optional, wrongly typed fields rejected);
+// the result is the set of methods to forward and the acknowledgement's
+// honoured subset (types this server does not support are omitted).
+func parseListenFilter(params json.RawMessage) (wanted map[string]bool, acked map[string]any, errDetails string) {
+	var shape struct {
+		Notifications any `json:"notifications"`
+	}
+	if json.Unmarshal(params, &shape) != nil {
+		return nil, nil, "params must be an object"
+	}
+	if _, ok := shape.Notifications.(map[string]any); !ok {
+		return nil, nil, "params.notifications must be an object"
+	}
+	var filter struct {
+		Notifications struct {
+			ToolsListChanged     bool `json:"toolsListChanged"`
+			PromptsListChanged   bool `json:"promptsListChanged"`
+			ResourcesListChanged bool `json:"resourcesListChanged"`
+		} `json:"notifications"`
+	}
+	if err := json.Unmarshal(params, &filter); err != nil {
+		return nil, nil, err.Error()
+	}
+	wanted, acked = map[string]bool{}, map[string]any{}
+	if filter.Notifications.ToolsListChanged {
+		wanted[NotificationToolsChanged], acked["toolsListChanged"] = true, true
+	}
+	if filter.Notifications.PromptsListChanged {
+		wanted[NotificationPromptsChanged], acked["promptsListChanged"] = true, true
+	}
+	if filter.Notifications.ResourcesListChanged {
+		wanted[NotificationResourcesChanged], acked["resourcesListChanged"] = true, true
+	}
+	return wanted, acked, ""
 }
 
 // streamNotifySink is a notificationSink that writes JSON-RPC notifications to a
@@ -126,11 +359,14 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer, o
 // keeps a slow/stuck client from stalling notification emission (which can run
 // under s.mu via RegisterTool). Events are dropped if the buffer fills.
 type streamNotifySink struct {
-	ch   chan sseEvent
-	out  io.Writer
-	mu   *sync.Mutex
-	done chan struct{}
+	ch      chan sseEvent
+	out     io.Writer
+	mu      *sync.Mutex
+	done    chan struct{}
+	enabled atomic.Bool // set once a Legacy initialize negotiated listChanged
 }
+
+func (sn *streamNotifySink) setEnabled(on bool) { sn.enabled.Store(on) }
 
 func newStreamNotifySink(out io.Writer, mu *sync.Mutex) *streamNotifySink {
 	sn := &streamNotifySink{
@@ -144,6 +380,9 @@ func newStreamNotifySink(out io.Writer, mu *sync.Mutex) *streamNotifySink {
 }
 
 func (sn *streamNotifySink) send(method string, params any) {
+	if !sn.enabled.Load() {
+		return // not negotiated (2024-11-05) or a Modern client: no unsolicited pushes
+	}
 	select {
 	case sn.ch <- sseEvent{method: method, params: params}:
 	default: // buffer full: drop (listChanged is an idempotent re-fetch hint)
@@ -246,6 +485,11 @@ func (s *Server) newStdioDispatcher() *jsonrpc.Server {
 	srv.Handle("server/discover", s.wrapStdioModern("server/discover", func(ctx context.Context, params json.RawMessage) (any, error) {
 		return s.buildDiscoverResult(ctx, GetShowAllTools(ctx)), nil
 	}))
+
+	// subscriptions/listen (Modern only): see stdioSubscriptionsListen. The
+	// handler blocks for the life of the subscription; ServeStream runs
+	// every message on its own goroutine, so that costs nothing else.
+	srv.Handle("subscriptions/listen", s.wrapStdioModern("subscriptions/listen", s.stdioSubscriptionsListen))
 
 	return srv
 }

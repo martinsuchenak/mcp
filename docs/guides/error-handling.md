@@ -33,11 +33,18 @@ if err != nil {
 Use when you need a specific error code or structured detail:
 
 ```go
-return nil, mcp.NewToolError(-32001, "file too large", map[string]any{
+return nil, mcp.NewToolError(1001, "file too large", map[string]any{
     "max_size": maxSize,
     "provided": size,
 })
 ```
+
+Prefer a tool execution error for anything that is the tool's own failure
+(an upstream API error, a business rule, a value in the wrong format): return
+`mcp.NewToolResponseError("...")`, or simply a plain `error`, and the server
+reports it inside the result with `isError: true`, which is what the MCP tools
+spec asks for and what lets the model read the message and self-correct.
+`NewToolError` is for protocol-level failures only.
 
 ## Error Code Reference
 
@@ -51,7 +58,11 @@ Standard JSON-RPC codes used by the library:
 | `-32602` | Invalid params |
 | `-32603` | Internal error |
 
-Use `-32001` to `-32099` for your own custom server errors.
+Pick custom codes outside `-32768..-32000`: MCP 2026-07-28 reserves
+`-32020..-32099` for protocol-defined codes and discourages `-32000..-32019`
+for new implementations. A Modern (2026-07-28) client is never sent a foreign
+code from that range — the server remaps it to `-32603` and keeps the original
+in `data.originalCode`.
 
 ## Best Practices
 

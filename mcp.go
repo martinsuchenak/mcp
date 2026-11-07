@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -424,6 +425,7 @@ func (s *Server) CallTool(ctx context.Context, name string, args map[string]any)
 	if tool, exists := s.tools[name]; exists {
 		handler := tool.Handler
 		schema := tool.Schema
+		outputSchema := tool.OutputSchema
 		s.mu.RUnlock()
 
 		// Validate required parameters
@@ -432,7 +434,11 @@ func (s *Server) CallTool(ctx context.Context, name string, args map[string]any)
 		}
 
 		toolReq := &ToolRequest{args: args}
-		return handler(ctx, toolReq)
+		resp, err := handler(ctx, toolReq)
+		if err == nil && outputSchema != nil {
+			resp = checkStructuredOutput(outputSchema, resp)
+		}
+		return resp, err
 	}
 
 	// Fast lookup for remote tools (registered via RegisterRemoteServer)
@@ -564,4 +570,85 @@ func promptsGetWireError(name string, err error) *MCPError {
 		return &MCPError{Code: toolErr.Code, Message: toolErr.Message, Data: toolErr.Data}
 	}
 	return &MCPError{Code: ErrorCodeInternalError, Message: fmt.Sprintf("Prompt render failed: %v", err)}
+}
+
+// checkStructuredOutput enforces the tools spec's rule that a tool with an
+// outputSchema "MUST provide structured results that conform to this
+// schema": a successful response with no structuredContent, or one missing
+// a required property or carrying the wrong primitive type for one, is
+// turned into a tool execution error naming the defect, so the problem
+// surfaces to the model and the developer instead of an invalid result
+// going out on the wire. An isError response is left alone.
+func checkStructuredOutput(outputSchema any, resp *ToolResponse) *ToolResponse {
+	if resp == nil || resp.IsError {
+		return resp
+	}
+	if resp.StructuredContent == nil {
+		return NewToolResponseError("tool declares an outputSchema but returned no structuredContent")
+	}
+	schema, _ := outputSchema.(map[string]any)
+	if schema == nil {
+		return resp
+	}
+	raw, err := json.Marshal(resp.StructuredContent)
+	if err != nil {
+		return NewToolResponseError("structuredContent cannot be encoded: " + err.Error())
+	}
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return resp // not an object: nothing the property checks apply to
+	}
+	var required []string
+	switch r := schema["required"].(type) {
+	case []string:
+		required = r
+	case []any:
+		for _, v := range r {
+			if name, ok := v.(string); ok {
+				required = append(required, name)
+			}
+		}
+	}
+	for _, name := range required {
+		if _, present := obj[name]; !present {
+			return NewToolResponseError("structuredContent does not conform to outputSchema: missing required property " + name)
+		}
+	}
+	if props, ok := schema["properties"].(map[string]any); ok {
+		for name, v := range obj {
+			prop, _ := props[name].(map[string]any)
+			want, _ := prop["type"].(string)
+			if want == "" || v == nil || jsonValueMatchesType(v, want) {
+				continue
+			}
+			return NewToolResponseError(fmt.Sprintf("structuredContent does not conform to outputSchema: property %s is not of type %s", name, want))
+		}
+	}
+	return resp
+}
+
+// jsonValueMatchesType reports whether a decoded JSON value has the JSON
+// Schema primitive type want.
+func jsonValueMatchesType(v any, want string) bool {
+	switch want {
+	case "string":
+		_, ok := v.(string)
+		return ok
+	case "number":
+		_, ok := v.(float64)
+		return ok
+	case "integer":
+		f, ok := v.(float64)
+		return ok && f == float64(int64(f))
+	case "boolean":
+		_, ok := v.(bool)
+		return ok
+	case "object":
+		_, ok := v.(map[string]any)
+		return ok
+	case "array":
+		_, ok := v.([]any)
+		return ok
+	}
+	return true
 }

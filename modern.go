@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -26,20 +27,14 @@ import (
 // the existing Legacy code, completely unchanged. See isModernRequest. See https://modelcontextprotocol.io/specification/2026-07-28
 // and docs/guides/protocol-support.md for the full picture.
 //
-// Known gaps, deliberately out of scope for this pass (see the guide):
+// Known gaps, deliberately out of scope (see the guide):
 //   - MRTR (server-initiated sampling/elicitation/roots) — this library
 //     implements none of these in either era, so there is nothing to migrate.
-//   - stdio does not implement subscriptions/listen: doing so correctly needs
-//     the calling request's own JSON-RPC id (to use as the subscription id)
-//     and a way to cancel a still-open subscription on an inbound
-//     notifications/cancelled — neither is something the underlying jsonrpc
-//     package's Handler signature exposes today, and stdio's existing
-//     connection-scoped notification delivery (every connected client
-//     already receives every listChanged notification, regardless of era)
-//     means nothing is functionally lost by not having it. A stdio client
-//     that calls it gets a standard, honest "Method not found" (-32601) —
-//     see TestStdioSubscriptionsListenNotSupported — rather than a silent or
-//     partial implementation.
+//
+// stdio serves subscriptions/listen too (server_stdio.go's
+// stdioSubscriptionsListen): ServeStream's own read loop hands each request
+// its id and a stream writer through the context, and routes
+// notifications/cancelled to the request's context.
 const (
 	// MCPProtocolVersionModern is the current Modern-era protocol revision.
 	MCPProtocolVersionModern = "2026-07-28"
@@ -517,6 +512,12 @@ func (s *Server) modernShape(method string, capture *modernResponseCapture, perU
 		return capturedResponse{status: capture.status, header: capture.header, body: capture.body.Bytes()}
 	}
 
+	if errRaw, ok := raw["error"].(map[string]any); ok {
+		if code, ok := errRaw["code"].(float64); ok && isForeignReservedErrorCode(int(code)) {
+			raw["error"] = remapReservedErrorCode(int(code), errRaw)
+		}
+	}
+
 	if resultRaw, ok := raw["result"]; ok {
 		resultMap, ok := resultRaw.(map[string]any)
 		if !ok {
@@ -542,6 +543,45 @@ func (s *Server) modernShape(method string, capture *modernResponseCapture, perU
 	header.Set("Content-Type", "application/json; charset=utf-8")
 	header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	return capturedResponse{status: capture.status, header: header, body: body.Bytes()}
+}
+
+// isForeignReservedErrorCode reports whether code lies in the range the
+// 2026-07-28 revision reserves (-32000..-32099) without being one of the
+// codes it defines there (HeaderMismatch, MissingRequiredClientCapability,
+// UnsupportedProtocolVersion): "implementations MUST NOT emit any code from
+// [-32020..-32099] not defined by this specification", and new ones should
+// not use -32000..-32019 either. Such a code (an application's own
+// NewToolError, or one forwarded from a federated Legacy server) is not
+// sent to a Modern client as-is.
+func isForeignReservedErrorCode(code int) bool {
+	if code > ErrorCodeImplementationErrorStart || code < ErrorCodeImplementationErrorEnd {
+		return false
+	}
+	switch code {
+	case ErrorCodeHeaderMismatch, ErrorCodeMissingRequiredClientCapability, ErrorCodeUnsupportedProtocolVersion:
+		return false
+	}
+	return true
+}
+
+// remapReservedErrorCode rewrites a foreign reserved code as InternalError,
+// keeping the original code in data.originalCode so nothing is lost.
+func remapReservedErrorCode(code int, errObj map[string]any) map[string]any {
+	out := make(map[string]any, len(errObj))
+	for k, v := range errObj {
+		out[k] = v
+	}
+	out["code"] = ErrorCodeInternalError
+	data, _ := out["data"].(map[string]any)
+	if data == nil {
+		data = map[string]any{}
+		if prev, ok := out["data"]; ok && prev != nil {
+			data["details"] = prev
+		}
+	}
+	data["originalCode"] = code
+	out["data"] = data
+	return out
 }
 
 // serverInfoMap builds the io.modelcontextprotocol/serverInfo object shared
@@ -658,6 +698,11 @@ func (s *Server) wrapStdioModern(method string, handler func(ctx context.Context
 
 		result, err := handler(withStdioModern(ctx), params)
 		if err != nil {
+			var rpcErr *jsonrpc.Error
+			if errors.As(err, &rpcErr) && isForeignReservedErrorCode(rpcErr.Code) {
+				remapped := remapReservedErrorCode(rpcErr.Code, map[string]any{"code": rpcErr.Code, "message": rpcErr.Message, "data": rpcErr.Data})
+				return nil, jsonrpc.NewError(ErrorCodeInternalError, rpcErr.Message, remapped["data"])
+			}
 			return result, err
 		}
 		return s.shapeModernResult(ctx, method, result), nil

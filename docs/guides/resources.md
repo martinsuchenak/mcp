@@ -208,7 +208,7 @@ See the [stdio-server](../../examples/stdio-server) and [stdio-client](../../exa
 
 ## Capabilities
 
-The server always advertises the `resources` capability in `initialize` (with `subscribe` and `listChanged` set to `false` — change notifications are not yet implemented). Clients can therefore rely on `resources/*` methods being available regardless of how many resources are registered.
+The server always advertises the `resources` capability in `initialize` (`listChanged` is `true` from 2025-03-26 on — see the [Notifications guide](notifications.md); `subscribe` is `false`, since per-resource update subscriptions are not implemented). Clients can therefore rely on `resources/*` methods being available regardless of how many resources are registered.
 
 ## Security
 
