@@ -228,6 +228,83 @@ func (s *Server) writeModernResult(w http.ResponseWriter, id any, result any) {
 	s.writeMCPResponse(w, http.StatusOK, id, result)
 }
 
+// modernHeaderValue returns the single value of a Modern standard header
+// (Mcp-Method, Mcp-Name, MCP-Protocol-Version), or "" when it is absent.
+// msg is non-empty, for the HeaderMismatch error, when the header is sent
+// more than once or its value contains characters a header value may not
+// (see isValidHeaderValue): both fail the spec's server validation.
+func modernHeaderValue(r *http.Request, name string) (value string, msg string) {
+	values := r.Header.Values(name)
+	if len(values) == 0 {
+		return "", ""
+	}
+	if len(values) > 1 {
+		return "", fmt.Sprintf("Header mismatch: multiple %s header values", name)
+	}
+	if !isValidHeaderValue(values[0]) {
+		return "", fmt.Sprintf("Header mismatch: %s header value contains invalid characters", name)
+	}
+	return values[0], ""
+}
+
+// modernClientCapabilities returns a Modern request's _meta
+// clientCapabilities, which must be present and a JSON object. details is
+// non-empty, for the InvalidParams error, when it is not.
+//
+// A missing required _meta field is malformed per the spec's general _meta
+// rule and gets InvalidParams — distinct from
+// MissingRequiredClientCapabilityError (-32021), which is reserved for
+// clientCapabilities being present but lacking a specific capability a
+// particular operation requires; this codebase has no such per-operation
+// capability requirement today.
+func modernClientCapabilities(meta map[string]any) (capabilities map[string]any, details string) {
+	raw, ok := meta[metaKeyClientCapabilities]
+	if !ok {
+		return nil, metaKeyClientCapabilities + " is required in _meta"
+	}
+	capabilities, ok = raw.(map[string]any)
+	if !ok || capabilities == nil {
+		return nil, metaKeyClientCapabilities + " must be a JSON object"
+	}
+	return capabilities, ""
+}
+
+// modernClientContextKey is the context key for a Modern request's own
+// client capabilities and client info.
+type modernClientContextKey struct{}
+
+type modernClientContext struct {
+	capabilities map[string]any
+	info         map[string]any
+}
+
+func withModernClientContext(ctx context.Context, capabilities, info map[string]any) context.Context {
+	return context.WithValue(ctx, modernClientContextKey{}, modernClientContext{capabilities: capabilities, info: info})
+}
+
+// ClientCapabilitiesFromContext returns the client capabilities declared in
+// _meta by the Modern-era (2026-07-28) request ctx belongs to, or nil when
+// ctx is not from a Modern request.
+//
+// Modern handlers should prefer this over [Server.ClientCapabilities]: the
+// Modern protocol is stateless, so each request carries its own
+// capabilities, and Server.ClientCapabilities only reports whichever
+// request (from any client) arrived last.
+func ClientCapabilitiesFromContext(ctx context.Context) map[string]any {
+	c, _ := ctx.Value(modernClientContextKey{}).(modernClientContext)
+	return c.capabilities
+}
+
+// ClientInfoFromContext returns the client info (name, version, ...)
+// declared in _meta by the Modern-era (2026-07-28) request ctx belongs to,
+// or nil when ctx is not from a Modern request or the request sent none.
+// Like [ClientCapabilitiesFromContext], it is per request, so concurrent
+// clients never see each other's values.
+func ClientInfoFromContext(ctx context.Context) map[string]any {
+	c, _ := ctx.Value(modernClientContextKey{}).(modernClientContext)
+	return c.info
+}
+
 // handleModernRequest validates a Modern-era HTTP request (header/body
 // consistency, protocol version, required client capabilities) and, once
 // valid, either serves a Modern-only method (server/discover,
@@ -236,7 +313,11 @@ func (s *Server) writeModernResult(w http.ResponseWriter, id any, result any) {
 func (s *Server) handleModernRequest(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
 	params, meta := modernRequestParams(req)
 
-	mcpMethodHeader := r.Header.Get(headerMcpMethod)
+	mcpMethodHeader, msg := modernHeaderValue(r, headerMcpMethod)
+	if msg != "" {
+		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeHeaderMismatch, msg, nil)
+		return
+	}
 	if mcpMethodHeader == "" {
 		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeHeaderMismatch,
 			"Header mismatch: Mcp-Method header is required", nil)
@@ -249,7 +330,11 @@ func (s *Server) handleModernRequest(w http.ResponseWriter, r *http.Request, req
 	}
 
 	if name, needsName := modernRequestName(req.Method, params); needsName {
-		rawHeaderName := r.Header.Get(headerMcpName)
+		rawHeaderName, msg := modernHeaderValue(r, headerMcpName)
+		if msg != "" {
+			s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeHeaderMismatch, msg, nil)
+			return
+		}
 		if rawHeaderName == "" {
 			s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeHeaderMismatch,
 				"Header mismatch: Mcp-Name header is required", nil)
@@ -264,7 +349,11 @@ func (s *Server) handleModernRequest(w http.ResponseWriter, r *http.Request, req
 	}
 
 	metaVersion, _ := meta[metaKeyProtocolVersion].(string)
-	headerVersion := r.Header.Get(headerProtocolVersion)
+	headerVersion, msg := modernHeaderValue(r, headerProtocolVersion)
+	if msg != "" {
+		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeHeaderMismatch, msg, nil)
+		return
+	}
 	if headerVersion == "" {
 		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeHeaderMismatch,
 			"Header mismatch: MCP-Protocol-Version header is required", nil)
@@ -284,30 +373,29 @@ func (s *Server) handleModernRequest(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 
-	// A request missing a required _meta field (here: clientCapabilities
-	// itself absent) is malformed per the spec's general _meta rule and gets
-	// InvalidParams/400 — distinct from MissingRequiredClientCapabilityError
-	// (-32021), which is reserved for clientCapabilities being *present* but
-	// lacking a specific capability a particular operation requires; this
-	// codebase has no such per-operation capability requirement today.
-	clientCapabilities, ok := meta[metaKeyClientCapabilities]
-	if !ok {
+	// clientCapabilities absent or not an object is InvalidParams/400; see
+	// modernClientCapabilities.
+	capMap, details := modernClientCapabilities(meta)
+	if details != "" {
 		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeInvalidParams,
-			"Invalid params", map[string]any{
-				"details": metaKeyClientCapabilities + " is required in _meta",
-			})
+			"Invalid params", map[string]any{"details": details})
 		return
 	}
 
 	// Remember the client's declared capabilities on every Modern request (there's
 	// no separate initialize call in this era) so ClientCapabilities/SupportsUIApps
-	// work the same way they do for Legacy clients. See ClientCapabilities' doc
-	// comment for the multi-client-HTTP caveat this shares with the Legacy path.
-	if capMap, ok := clientCapabilities.(map[string]any); ok {
-		s.mu.Lock()
-		s.lastClientCapabilities = capMap
-		s.mu.Unlock()
-	}
+	// keep working the same way they do for Legacy clients. See ClientCapabilities'
+	// doc comment for the multi-client-HTTP caveat this shares with the Legacy path.
+	s.mu.Lock()
+	s.lastClientCapabilities = capMap
+	s.mu.Unlock()
+
+	// The spec forbids relying on prior requests for context, so this
+	// request's own capabilities and client info also travel on its context
+	// (ClientCapabilitiesFromContext, ClientInfoFromContext), where concurrent
+	// requests from different clients cannot overwrite each other.
+	clientInfo, _ := meta[metaKeyClientInfo].(map[string]any)
+	r = r.WithContext(withModernClientContext(r.Context(), capMap, clientInfo))
 
 	// x-mcp-header: every Mcp-Param-* header a tool declares must match the
 	// body before the tool runs (xmcpheader.go).
@@ -334,7 +422,10 @@ func (s *Server) handleModernRequest(w http.ResponseWriter, r *http.Request, req
 				"Method not found", map[string]any{"method": req.Method})
 			return
 		}
-		s.dispatchResponse(w, r, req, s.modernShape)
+		perUser := isPerUserRequest(r)
+		s.dispatchResponse(w, r, req, func(method string, capture *modernResponseCapture) capturedResponse {
+			return s.modernShape(method, capture, perUser)
+		})
 	}
 }
 
@@ -349,7 +440,9 @@ func (s *Server) handleModernRequest(w http.ResponseWriter, r *http.Request, req
 // list methods (the library's own lists are caller-independent; per-user
 // listings arrive through providers, same as tools); "private" is the
 // conservative choice for reads and skills/get, whose result is one
-// caller-addressed document.
+// caller-addressed document. These are the caller-independent defaults;
+// results are shaped with cacheHintsForRequest, which downgrades "public"
+// to "private" when the request may be answered per user.
 func cacheHintsFor(method string) (ttlMs int, cacheScope string, applicable bool) {
 	switch method {
 	case "tools/list", "prompts/list", "resources/list", "resources/templates/list", "skills/list":
@@ -359,6 +452,37 @@ func cacheHintsFor(method string) (ttlMs int, cacheScope string, applicable bool
 	default:
 		return 0, "", false
 	}
+}
+
+// cacheHintsForRequest is cacheHintsFor for a specific request: perUser
+// (see isPerUserRequest) turns "public" into "private", since the spec's
+// "public" asserts the result holds no user-specific data, which a list
+// served to an authenticated caller or built from context-scoped providers
+// cannot promise.
+func cacheHintsForRequest(method string, perUser bool) (ttlMs int, cacheScope string, applicable bool) {
+	ttlMs, cacheScope, applicable = cacheHintsFor(method)
+	if applicable && perUser {
+		cacheScope = "private"
+	}
+	return ttlMs, cacheScope, applicable
+}
+
+// isPerUserRequest reports whether r's result may differ per caller: it
+// carries credentials (an Authorization header or a cookie), or its context
+// has request-scoped tool, prompt, resource or skill providers attached.
+func isPerUserRequest(r *http.Request) bool {
+	if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+		return true
+	}
+	return hasContextProviders(r.Context())
+}
+
+// hasContextProviders reports whether ctx carries any request-scoped
+// provider (WithToolProviders, WithPromptProviders, WithResourceProviders,
+// WithSkillProviders), whose listings may be per user.
+func hasContextProviders(ctx context.Context) bool {
+	return len(GetToolProviders(ctx)) > 0 || len(GetPromptProviders(ctx)) > 0 ||
+		len(GetResourceProviders(ctx)) > 0 || len(GetSkillProviders(ctx)) > 0
 }
 
 // modernResponseCapture buffers a Legacy handler's output so
@@ -385,8 +509,9 @@ func (c *modernResponseCapture) WriteHeader(status int) { c.status = status }
 // _meta.io.modelcontextprotocol/serverInfo; JSON-RPC-level errors (e.g.
 // unknown tool) pass through unchanged, since those are ordinary method
 // errors in both eras, not protocol-level ones. The result is written as
-// JSON or as an SSE event by dispatchResponse (server_stream.go).
-func (s *Server) modernShape(method string, capture *modernResponseCapture) capturedResponse {
+// JSON or as an SSE event by dispatchResponse (server_stream.go). perUser
+// selects the cacheScope (see cacheHintsForRequest).
+func (s *Server) modernShape(method string, capture *modernResponseCapture, perUser bool) capturedResponse {
 	var raw map[string]any
 	if err := json.Unmarshal(capture.body.Bytes(), &raw); err != nil {
 		return capturedResponse{status: capture.status, header: capture.header, body: capture.body.Bytes()}
@@ -398,7 +523,7 @@ func (s *Server) modernShape(method string, capture *modernResponseCapture) capt
 			resultMap = map[string]any{}
 		}
 		resultMap["resultType"] = "complete"
-		if ttlMs, cacheScope, ok := cacheHintsFor(method); ok {
+		if ttlMs, cacheScope, ok := cacheHintsForRequest(method, perUser); ok {
 			resultMap["ttlMs"] = ttlMs
 			resultMap["cacheScope"] = cacheScope
 		}
@@ -448,18 +573,28 @@ func (s *Server) buildDiscoverResult(ctx context.Context, showAll bool) map[stri
 		instructions = appendDiscoveryInstructions(instructions)
 	}
 
-	return map[string]any{
+	// server/discover is one of the cacheable operations the spec requires
+	// caching hints on; see cacheHintsFor's doc comment for why 0/"public"
+	// are the honest defaults here. Context-scoped providers can change the
+	// instructions per caller, so they make it "private";
+	// handleServerDiscoverHTTP also does so for credentialed requests.
+	cacheScope := "public"
+	if hasContextProviders(ctx) {
+		cacheScope = "private"
+	}
+	result := map[string]any{
 		"resultType":        "complete",
 		"supportedVersions": allSupportedProtocolVersions(),
 		"capabilities":      s.buildCapabilities(MCPProtocolVersionModern),
 		"_meta":             map[string]any{metaKeyServerInfo: s.serverInfoMap()},
-		"instructions":      instructions,
-		// server/discover is one of the cacheable operations the spec
-		// requires caching hints on; see cacheHintsFor's doc comment for why
-		// 0/"public" are the honest defaults here.
-		"ttlMs":      0,
-		"cacheScope": "public",
+		"ttlMs":             0,
+		"cacheScope":        cacheScope,
 	}
+	// instructions is optional; an empty string carries no information.
+	if instructions != "" {
+		result["instructions"] = instructions
+	}
+	return result
 }
 
 // rejectStdioModern wraps a Legacy-only stdio method ("initialize", "ping" —
@@ -505,34 +640,37 @@ func (s *Server) wrapStdioModern(method string, handler func(ctx context.Context
 			})
 		}
 
-		// See handleModernRequest's identical check (modern.go) for why this
-		// is InvalidParams, not MissingRequiredClientCapabilityError: the
-		// field itself is absent, which is a different, more general defect
-		// than clientCapabilities being present but missing one specific
-		// capability an operation requires.
-		clientCapabilities, ok := meta[metaKeyClientCapabilities]
-		if !ok {
+		// Same check as handleModernRequest; see modernClientCapabilities
+		// for why this is InvalidParams.
+		capMap, details := modernClientCapabilities(meta)
+		if details != "" {
 			return nil, jsonrpc.NewError(ErrorCodeInvalidParams, "Invalid params", map[string]any{
-				"details": metaKeyClientCapabilities + " is required in _meta",
+				"details": details,
 			})
 		}
-		if capMap, ok := clientCapabilities.(map[string]any); ok {
-			s.mu.Lock()
-			s.lastClientCapabilities = capMap
-			s.mu.Unlock()
-		}
+		s.mu.Lock()
+		s.lastClientCapabilities = capMap
+		s.mu.Unlock()
+
+		// Per-request client context, as handleModernRequest does.
+		clientInfo, _ := meta[metaKeyClientInfo].(map[string]any)
+		ctx = withModernClientContext(ctx, capMap, clientInfo)
 
 		result, err := handler(withStdioModern(ctx), params)
 		if err != nil {
 			return result, err
 		}
-		return s.shapeModernResult(method, result), nil
+		return s.shapeModernResult(ctx, method, result), nil
 	}
 }
 
 // stdioModernMeta parses a stdio request's raw params and reports whether
 // they carry the Modern-era protocolVersion signal; when they do, it also
-// returns the parsed _meta map for wrapStdioModern's validation.
+// returns the parsed _meta map for wrapStdioModern's validation. Like
+// isModernRequest, a claim naming a Legacy revision is not Modern: it falls
+// through to the Legacy handler. Any other claim, including an unknown or
+// newer revision, is Modern, so wrapStdioModern can answer it with
+// UnsupportedProtocolVersionError.
 func stdioModernMeta(params json.RawMessage) (meta map[string]any, isModern bool) {
 	if len(params) == 0 {
 		return nil, false
@@ -543,7 +681,8 @@ func stdioModernMeta(params json.RawMessage) (meta map[string]any, isModern bool
 	if json.Unmarshal(params, &parsed) != nil {
 		return nil, false
 	}
-	if _, ok := parsed.Meta[metaKeyProtocolVersion].(string); !ok {
+	version, ok := parsed.Meta[metaKeyProtocolVersion].(string)
+	if !ok || isLegacyProtocolVersion(version) {
 		return nil, false
 	}
 	return parsed.Meta, true
@@ -552,8 +691,9 @@ func stdioModernMeta(params json.RawMessage) (meta map[string]any, isModern bool
 // shapeModernResult is modernShape's transport-agnostic core,
 // operating on an already-decoded result value (stdio has no HTTP response
 // to capture and rewrite): resultType, _meta.serverInfo, and — for cacheable
-// operations — ttlMs/cacheScope.
-func (s *Server) shapeModernResult(method string, result any) any {
+// operations — ttlMs/cacheScope. stdio has no credential headers, so only
+// context-scoped providers on ctx make the cacheScope "private".
+func (s *Server) shapeModernResult(ctx context.Context, method string, result any) any {
 	data, err := json.Marshal(result)
 	if err != nil {
 		return result
@@ -563,7 +703,7 @@ func (s *Server) shapeModernResult(method string, result any) any {
 		return result
 	}
 	resultMap["resultType"] = "complete"
-	if ttlMs, cacheScope, ok := cacheHintsFor(method); ok {
+	if ttlMs, cacheScope, ok := cacheHintsForRequest(method, hasContextProviders(ctx)); ok {
 		resultMap["ttlMs"] = ttlMs
 		resultMap["cacheScope"] = cacheScope
 	}
@@ -577,7 +717,11 @@ func (s *Server) shapeModernResult(method string, result any) any {
 }
 
 func (s *Server) handleServerDiscoverHTTP(w http.ResponseWriter, r *http.Request, req *MCPRequest) {
-	s.writeModernResult(w, req.ID, s.buildDiscoverResult(r.Context(), GetShowAllFromRequest(r)))
+	result := s.buildDiscoverResult(r.Context(), GetShowAllFromRequest(r))
+	if isPerUserRequest(r) {
+		result["cacheScope"] = "private"
+	}
+	s.writeModernResult(w, req.ID, result)
 }
 
 // modernSubscriptionSink is a notificationSink that only forwards the
@@ -641,6 +785,18 @@ func (s *Server) handleSubscriptionsListen(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// params.notifications must be present and an object; every field inside
+	// it is optional. Types this server does not support (anything but the
+	// three list_changed ones, e.g. resourceSubscriptions) are omitted from
+	// the acknowledgement, which may therefore be empty; the stream still
+	// stays open (heartbeats only) until the client closes it or Shutdown.
+	params, _ := modernRequestParams(req)
+	if _, ok := params["notifications"].(map[string]any); !ok {
+		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeInvalidParams,
+			"Invalid params", map[string]any{"details": "params.notifications must be an object"})
+		return
+	}
+
 	var filter struct {
 		Notifications struct {
 			ToolsListChanged     bool `json:"toolsListChanged"`
@@ -648,13 +804,8 @@ func (s *Server) handleSubscriptionsListen(w http.ResponseWriter, r *http.Reques
 			ResourcesListChanged bool `json:"resourcesListChanged"`
 		} `json:"notifications"`
 	}
-	// A body that doesn't even unmarshal into this shape (params.notifications
-	// present but not an object, say) used to be silently ignored here,
-	// leaving every field at its zero value — indistinguishable from a
-	// deliberate "no notifications yet" request. That, and an empty/all-false
-	// notifications object, both used to fall through to a 200 that opens the
-	// SSE stream anyway, subscribed to nothing, with no way for the caller to
-	// learn why nothing ever arrives. Both are now rejected up front instead.
+	// A field of the wrong type (a non-boolean toolsListChanged, say) is
+	// rejected rather than silently read as false.
 	if err := s.parseParams(req, &filter); err != nil {
 		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeInvalidParams,
 			"Invalid params", map[string]any{"details": err.Error()})
@@ -674,11 +825,6 @@ func (s *Server) handleSubscriptionsListen(w http.ResponseWriter, r *http.Reques
 	if filter.Notifications.ResourcesListChanged {
 		wanted[NotificationResourcesChanged] = true
 		acked["resourcesListChanged"] = true
-	}
-	if len(wanted) == 0 {
-		s.writeModernProtocolError(w, req.ID, http.StatusBadRequest, ErrorCodeInvalidParams,
-			"Invalid params", map[string]any{"details": "params.notifications must select at least one notification type"})
-		return
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")

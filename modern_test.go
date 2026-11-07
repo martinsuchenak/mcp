@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/paularlott/jsonrpc"
 )
@@ -1026,6 +1029,59 @@ func TestCacheHintsFor(t *testing.T) {
 			t.Errorf("cacheHintsFor(%q): applicable = true, want false (not a cacheable list/read op)", method)
 		}
 	}
+	for method := range wantApplicable {
+		if _, scope, _ := cacheHintsForRequest(method, true); scope != "private" {
+			t.Errorf("cacheHintsForRequest(%q, perUser): cacheScope = %q, want private", method, scope)
+		}
+		_, want, _ := cacheHintsFor(method)
+		if _, scope, _ := cacheHintsForRequest(method, false); scope != want {
+			t.Errorf("cacheHintsForRequest(%q, !perUser): cacheScope = %q, want %q", method, scope, want)
+		}
+	}
+}
+
+// TestModernRequest_CacheScopePerUser covers that a list result is only
+// "public" when nothing about the request makes it per user: credentials
+// (Authorization, Cookie) or context-scoped providers make it "private".
+func TestModernRequest_CacheScopePerUser(t *testing.T) {
+	s := NewServer("cache-scope", "1")
+	s.RegisterTool(NewTool("echo", "echoes"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+		return NewToolResponseText("ok"), nil
+	})
+	withProvider := func(w http.ResponseWriter, r *http.Request) {
+		s.HandleRequest(w, r.WithContext(WithToolProviders(r.Context(), headerProvider{})))
+	}
+
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+		headers map[string]string
+		want    string
+	}{
+		{"anonymous tools/list", s.HandleRequest, "tools/list", nil, "public"},
+		{"authorized tools/list", s.HandleRequest, "tools/list", map[string]string{"Authorization": "Bearer x"}, "private"},
+		{"cookie tools/list", s.HandleRequest, "tools/list", map[string]string{"Cookie": "a=b"}, "private"},
+		{"provider tools/list", withProvider, "tools/list", nil, "private"},
+		{"anonymous server/discover", s.HandleRequest, "server/discover", nil, "public"},
+		{"authorized server/discover", s.HandleRequest, "server/discover", map[string]string{"Authorization": "Bearer x"}, "private"},
+		{"provider server/discover", withProvider, "server/discover", nil, "private"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := modernRequest(t, "/", tc.method, nil)
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			tc.handler(rec, req)
+			out := decodeMCPResponse(t, rec.Body.Bytes())
+			result, _ := out["result"].(map[string]any)
+			if result["cacheScope"] != tc.want {
+				t.Errorf("cacheScope = %v, want %s (body %s)", result["cacheScope"], tc.want, rec.Body.String())
+			}
+		})
+	}
 }
 
 // TestModernRequest_ToolCallErrorPassesThrough covers that an ordinary
@@ -1330,16 +1386,12 @@ func TestSubscriptionsListen(t *testing.T) {
 	}
 }
 
-// TestSubscriptionsListen_MalformedOrEmptyFilter_ReturnsError is the
-// regression test for a malformed or empty subscriptions/listen request
-// silently opening an SSE stream subscribed to nothing, forever: no
-// notification type would ever be forwarded (modernSubscriptionSink.send
-// checks `wanted[method]`, always false), and the caller would have no way
-// to learn why, since the request "succeeded" with a 200 and an
-// acknowledgement of an empty notification set. Every variant here must
-// instead get a synchronous JSON-RPC error and never register a live
-// subscriber.
-func TestSubscriptionsListen_MalformedOrEmptyFilter_ReturnsError(t *testing.T) {
+// TestSubscriptionsListen_MalformedFilter_ReturnsError covers a
+// subscriptions/listen request whose params.notifications is absent, not an
+// object, or has a wrongly-typed field: each gets a synchronous JSON-RPC
+// error and never registers a live subscriber. An object that selects no
+// supported type is valid (see TestSubscriptionsListen_UnsupportedOnlyFilter_AcksEmpty).
+func TestSubscriptionsListen_MalformedFilter_ReturnsError(t *testing.T) {
 	s := NewServer("subs-malformed", "1")
 	ts := httptest.NewServer(http.HandlerFunc(s.HandleRequest))
 	defer ts.Close()
@@ -1360,8 +1412,8 @@ func TestSubscriptionsListen_MalformedOrEmptyFilter_ReturnsError(t *testing.T) {
 	}{
 		{"notifications missing entirely", map[string]any{}},
 		{"notifications not an object", map[string]any{"notifications": "toolsListChanged"}},
-		{"notifications object, all false", map[string]any{"notifications": map[string]any{"toolsListChanged": false}}},
-		{"notifications object, only unrecognized keys", map[string]any{"notifications": map[string]any{"somethingElse": true}}},
+		{"notifications null", map[string]any{"notifications": nil}},
+		{"notifications field wrong type", map[string]any{"notifications": map[string]any{"toolsListChanged": "yes"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1381,6 +1433,57 @@ func TestSubscriptionsListen_MalformedOrEmptyFilter_ReturnsError(t *testing.T) {
 			}
 			if n := s.notifications.count(); n != 0 {
 				t.Errorf("subscriber count = %d, want 0 — a rejected request must not register a live, permanently-idle subscriber", n)
+			}
+		})
+	}
+}
+
+// TestSubscriptionsListen_UnsupportedOnlyFilter_AcksEmpty covers the spec's
+// "every field of params.notifications is optional" and "Notification types
+// the server does not support are omitted": a filter selecting none of the
+// list_changed types (only resourceSubscriptions, all false, unknown keys,
+// or {}) opens the stream and acknowledges an empty notifications object.
+func TestSubscriptionsListen_UnsupportedOnlyFilter_AcksEmpty(t *testing.T) {
+	cases := []struct {
+		name          string
+		notifications map[string]any
+	}{
+		{"resourceSubscriptions only", map[string]any{"resourceSubscriptions": []any{"file:///a.txt"}}},
+		{"empty object", map[string]any{}},
+		{"all false", map[string]any{"toolsListChanged": false}},
+		{"unrecognized keys only", map[string]any{"somethingElse": true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer("subs-empty", "1")
+			ts := httptest.NewServer(http.HandlerFunc(s.HandleRequest))
+			defer ts.Close()
+
+			req := modernRequest(t, ts.URL, "subscriptions/listen", map[string]any{"notifications": tc.notifications})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+
+			ack := newSSELineReader(resp.Body).next(t)
+			payload := strings.TrimSpace(strings.TrimPrefix(ack, "data:"))
+			var out map[string]any
+			if err := json.Unmarshal([]byte(payload), &out); err != nil {
+				t.Fatalf("decode ack: %v, payload: %s", err, payload)
+			}
+			if out["method"] != "notifications/subscriptions/acknowledged" {
+				t.Fatalf("expected ack first, got: %s", payload)
+			}
+			params, _ := out["params"].(map[string]any)
+			acked, ok := params["notifications"].(map[string]any)
+			if !ok || len(acked) != 0 {
+				t.Fatalf("acked notifications = %#v, want {}", params["notifications"])
 			}
 		})
 	}
@@ -1475,4 +1578,336 @@ func (s *sseLineReader) next(t *testing.T) string {
 	}
 	t.Fatal("did not receive a data: line")
 	return ""
+}
+
+// --- server validation: duplicate and malformed standard headers ---------
+
+// modernRecorderRequest builds a valid Modern tools/call request for
+// HandleRequest via httptest, so tests can set raw header values that a
+// real client would canonicalise or refuse to send.
+func modernRecorderRequest(t *testing.T, tool string) *http.Request {
+	t.Helper()
+	return modernRequest(t, "/", "tools/call", map[string]any{"name": tool, "arguments": map[string]any{}})
+}
+
+func TestModernRequest_DuplicateHeaders(t *testing.T) {
+	s := NewServer("dup", "1")
+	s.RegisterTool(NewTool("echo", "echoes"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+		return NewToolResponseText("ok"), nil
+	})
+
+	for _, header := range []string{headerMcpMethod, headerMcpName, headerProtocolVersion} {
+		t.Run(header, func(t *testing.T) {
+			req := modernRecorderRequest(t, "echo")
+			req.Header.Add(header, req.Header.Get(header)) // same value twice
+			rec := httptest.NewRecorder()
+			s.HandleRequest(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+			}
+			out := decodeMCPResponse(t, rec.Body.Bytes())
+			errObj, _ := out["error"].(map[string]any)
+			if int(errObj["code"].(float64)) != ErrorCodeHeaderMismatch {
+				t.Errorf("error = %#v, want HeaderMismatch", errObj)
+			}
+			want := "Header mismatch: multiple " + header + " header values"
+			if errObj["message"] != want {
+				t.Errorf("message = %v, want %q", errObj["message"], want)
+			}
+		})
+	}
+}
+
+func TestModernRequest_InvalidHeaderCharacters(t *testing.T) {
+	s := NewServer("badchars", "1")
+	s.RegisterTool(NewTool("café", "echoes"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+		return NewToolResponseText("ok"), nil
+	})
+
+	for _, header := range []string{headerMcpMethod, headerMcpName} {
+		t.Run(header, func(t *testing.T) {
+			req := modernRecorderRequest(t, "café")
+			raw := map[string]string{headerMcpMethod: "tools/callé", headerMcpName: "café"}[header]
+			req.Header[header] = []string{raw} // raw UTF-8, not Base64-encoded
+			rec := httptest.NewRecorder()
+			s.HandleRequest(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+			}
+			out := decodeMCPResponse(t, rec.Body.Bytes())
+			errObj, _ := out["error"].(map[string]any)
+			if int(errObj["code"].(float64)) != ErrorCodeHeaderMismatch {
+				t.Errorf("error = %#v, want HeaderMismatch", errObj)
+			}
+			want := "Header mismatch: " + header + " header value contains invalid characters"
+			if errObj["message"] != want {
+				t.Errorf("message = %v, want %q", errObj["message"], want)
+			}
+		})
+	}
+
+	t.Run("Base64-encoded Mcp-Name is accepted", func(t *testing.T) {
+		req := modernRecorderRequest(t, "café")
+		rec := httptest.NewRecorder()
+		s.HandleRequest(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// --- clientCapabilities must be an object --------------------------------
+
+func TestModernRequest_ClientCapabilitiesNotObject(t *testing.T) {
+	s := NewServer("caps-shape", "1")
+	for _, tc := range []struct {
+		name string
+		caps string
+	}{
+		{"null", `null`},
+		{"string", `"all"`},
+		{"array", `[]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"` +
+				metaKeyProtocolVersion + `":"` + MCPProtocolVersionModern + `","` +
+				metaKeyClientCapabilities + `":` + tc.caps + `}}}`
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(headerMcpMethod, "tools/list")
+			req.Header.Set(headerProtocolVersion, MCPProtocolVersionModern)
+			rec := httptest.NewRecorder()
+			s.HandleRequest(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+			}
+			out := decodeMCPResponse(t, rec.Body.Bytes())
+			errObj, _ := out["error"].(map[string]any)
+			if int(errObj["code"].(float64)) != ErrorCodeInvalidParams {
+				t.Errorf("error = %#v, want InvalidParams", errObj)
+			}
+			data, _ := errObj["data"].(map[string]any)
+			if details, _ := data["details"].(string); !strings.Contains(details, "must be a JSON object") {
+				t.Errorf("details = %v", data["details"])
+			}
+		})
+	}
+}
+
+// --- server/discover omits empty instructions ------------------------------
+
+func TestServerDiscover_OmitsEmptyInstructions(t *testing.T) {
+	s := NewServer("no-instructions", "1")
+	req := modernRequest(t, "/", "server/discover", nil)
+	rec := httptest.NewRecorder()
+	s.HandleRequest(rec, req)
+	out := decodeMCPResponse(t, rec.Body.Bytes())
+	result, _ := out["result"].(map[string]any)
+	if result == nil {
+		t.Fatalf("no result: %s", rec.Body.String())
+	}
+	if _, ok := result["instructions"]; ok {
+		t.Errorf("instructions = %#v, want it omitted when empty", result["instructions"])
+	}
+}
+
+// --- per-request client context -------------------------------------------
+
+// TestModernRequest_ClientContextIsPerRequest covers that each Modern
+// request's handler sees its own clientCapabilities and clientInfo via the
+// context accessors, even while another client's request is in flight
+// (Server.ClientCapabilities only remembers the last one).
+func TestModernRequest_ClientContextIsPerRequest(t *testing.T) {
+	s := NewServer("per-request", "1")
+	var arrived sync.WaitGroup
+	arrived.Add(2)
+	s.RegisterTool(NewTool("who", "reports the caller"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+		arrived.Done()
+		arrived.Wait() // both requests are now in flight
+		caps := ClientCapabilitiesFromContext(ctx)
+		info := ClientInfoFromContext(ctx)
+		return NewToolResponseText(fmt.Sprintf("%v/%v", caps["marker"], info["name"])), nil
+	})
+	ts := httptest.NewServer(http.HandlerFunc(s.HandleRequest))
+	defer ts.Close()
+
+	call := func(client string) (string, error) {
+		body, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+			"params": map[string]any{
+				"name": "who", "arguments": map[string]any{},
+				"_meta": map[string]any{
+					metaKeyProtocolVersion:    MCPProtocolVersionModern,
+					metaKeyClientCapabilities: map[string]any{"marker": client},
+					metaKeyClientInfo:         map[string]any{"name": client, "version": "1"},
+				},
+			},
+		})
+		req, _ := http.NewRequest(http.MethodPost, ts.URL, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(headerMcpMethod, "tools/call")
+		req.Header.Set(headerMcpName, "who")
+		req.Header.Set(headerProtocolVersion, MCPProtocolVersionModern)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Result struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"result"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return "", err
+		}
+		if len(out.Result.Content) == 0 {
+			return "", fmt.Errorf("no content")
+		}
+		return out.Result.Content[0].Text, nil
+	}
+
+	results := make(chan [2]string, 2)
+	for _, client := range []string{"alpha", "beta"} {
+		go func(client string) {
+			got, err := call(client)
+			if err != nil {
+				got = err.Error()
+			}
+			results <- [2]string{client, got}
+		}(client)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			if want := r[0] + "/" + r[0]; r[1] != want {
+				t.Errorf("client %s saw %q, want %q", r[0], r[1], want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent requests")
+		}
+	}
+
+	if ClientCapabilitiesFromContext(context.Background()) != nil || ClientInfoFromContext(context.Background()) != nil {
+		t.Error("accessors must return nil for a context without Modern client data")
+	}
+}
+
+// TestStdioModernRequest_ClientContext covers the stdio counterpart of
+// TestModernRequest_ClientContextIsPerRequest: the handler's ctx carries the
+// request's own clientCapabilities and clientInfo.
+func TestStdioModernRequest_ClientContext(t *testing.T) {
+	s := NewServer("stdio-ctx", "1")
+	s.RegisterTool(NewTool("who", "reports the caller"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+		caps := ClientCapabilitiesFromContext(ctx)
+		info := ClientInfoFromContext(ctx)
+		return NewToolResponseText(fmt.Sprintf("%v/%v", caps["marker"], info["name"])), nil
+	})
+	rpc, done := stdioTestClient(t, s)
+	defer done()
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	err := rpc.Call(context.Background(), "tools/call", map[string]any{
+		"name": "who", "arguments": map[string]any{},
+		"_meta": map[string]any{
+			metaKeyProtocolVersion:    MCPProtocolVersionModern,
+			metaKeyClientCapabilities: map[string]any{"marker": "gamma"},
+			metaKeyClientInfo:         map[string]any{"name": "gamma"},
+		},
+	}, &result)
+	if err != nil {
+		t.Fatalf("tools/call: %v", err)
+	}
+	if len(result.Content) == 0 || result.Content[0].Text != "gamma/gamma" {
+		t.Errorf("result = %#v, want gamma/gamma", result)
+	}
+}
+
+// --- stdio era routing ------------------------------------------------------
+
+// stdioTestClient serves s over an in-memory stdio pipe.
+func stdioTestClient(t *testing.T, s *Server) (*jsonrpc.Client, func()) {
+	t.Helper()
+	clientReader, serverWriter := io.Pipe()
+	serverReader, clientWriter := io.Pipe()
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = s.ServeStream(context.Background(), serverReader, serverWriter)
+	}()
+	rpc := jsonrpc.NewClient(jsonrpc.NewStreamTransport(clientReader, clientWriter))
+	return rpc, func() {
+		clientWriter.Close()
+		<-serveDone
+		serverWriter.Close()
+	}
+}
+
+// TestStdioModernMeta_LegacyClaimIsLegacy covers that stdio routing mirrors
+// isModernRequest: a _meta protocolVersion naming a Legacy revision is
+// Legacy (no Modern validation or shaping), anything else is Modern.
+func TestStdioModernMeta_LegacyClaimIsLegacy(t *testing.T) {
+	claim := func(v string) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"_meta": map[string]any{metaKeyProtocolVersion: v}})
+		return b
+	}
+	if _, isModern := stdioModernMeta(claim("2025-11-25")); isModern {
+		t.Error("Legacy claim 2025-11-25 must not be Modern")
+	}
+	if _, isModern := stdioModernMeta(claim(MCPProtocolVersionModern)); !isModern {
+		t.Error("Modern claim must be Modern")
+	}
+	if _, isModern := stdioModernMeta(claim("2099-01-01")); !isModern {
+		t.Error("unknown claim must be Modern, so it gets UnsupportedProtocolVersionError")
+	}
+
+	s := NewServer("stdio-legacy-claim", "1")
+	s.RegisterTool(NewTool("echo", "echoes"), func(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+		return NewToolResponseText("ok"), nil
+	})
+	rpc, done := stdioTestClient(t, s)
+	defer done()
+
+	// No clientCapabilities: Modern validation would reject this, Legacy
+	// dispatch serves it unshaped.
+	var result map[string]any
+	err := rpc.Call(context.Background(), "tools/list", map[string]any{
+		"_meta": map[string]any{metaKeyProtocolVersion: "2025-11-25"},
+	}, &result)
+	if err != nil {
+		t.Fatalf("tools/list with a Legacy claim: %v", err)
+	}
+	if _, ok := result["resultType"]; ok {
+		t.Errorf("Legacy-claim result must not be Modern-shaped: %#v", result)
+	}
+	if _, ok := result["tools"]; !ok {
+		t.Errorf("expected tools in result: %#v", result)
+	}
+}
+
+func TestStdioModernRequest_ClientCapabilitiesNotObject(t *testing.T) {
+	s := NewServer("stdio-caps-shape", "1")
+	rpc, done := stdioTestClient(t, s)
+	defer done()
+
+	var result map[string]any
+	err := rpc.Call(context.Background(), "tools/list", map[string]any{
+		"_meta": map[string]any{
+			metaKeyProtocolVersion:    MCPProtocolVersionModern,
+			metaKeyClientCapabilities: nil,
+		},
+	}, &result)
+	rpcErr, ok := err.(*jsonrpc.Error)
+	if !ok {
+		t.Fatalf("expected a *jsonrpc.Error, got %T: %v", err, err)
+	}
+	if rpcErr.Code != ErrorCodeInvalidParams {
+		t.Errorf("code = %d, want InvalidParams (%d)", rpcErr.Code, ErrorCodeInvalidParams)
+	}
 }

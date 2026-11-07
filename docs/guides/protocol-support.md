@@ -21,14 +21,17 @@ models:
 
 A `Server` built with this library implements both simultaneously ("Dual-era"):
 each incoming request is routed to whichever era it actually speaks, based only
-on the request body: a `io.modelcontextprotocol/protocolVersion` `_meta` claim
-naming a Modern revision selects Modern (on any transport); anything else,
-including `initialize`, is Legacy. The `MCP-Protocol-Version` header is only a
+on the request body: any `io.modelcontextprotocol/protocolVersion` `_meta`
+claim that does not name a supported Legacy revision selects the Modern path (on
+any transport), so an unknown or newer revision gets
+`UnsupportedProtocolVersionError` listing every supported version; a claim naming
+a Legacy revision is Legacy, and a request with no claim, including
+`initialize`, is always Legacy. The `MCP-Protocol-Version` header is only a
 cross-check (a Modern header with no `_meta` claim is refused as a malformed
 Modern request), and `Mcp-Method`/`Mcp-Name` are never an era signal — Legacy
 clients such as mcp-remote mirror them on every request too. Detection never
-looks at the transport, URL, or configuration. A Legacy request never touches any Modern-era
-code path, and vice versa.
+looks at the transport, URL, or configuration. A Legacy request never touches any
+Modern-era code path, and vice versa.
 
 A `Client` detects which era its server speaks the first time `Initialize` runs:
 it attempts a Modern `server/discover` call first, and falls back to the Legacy
