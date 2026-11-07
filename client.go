@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/paularlott/mcp/pool"
 )
@@ -32,16 +35,21 @@ type ToolFilterFunc func(toolName string) bool
 
 // Client represents an MCP client for connecting to remote servers
 type Client struct {
-	baseURL      string
-	httpClient   *http.Client
-	auth         AuthProvider
-	namespace    string         // Optional namespace for tool names (e.g., "scriptling.")
-	separator    string         // Separator for namespace
-	cachedTools  []MCPTool      // Cached tools with namespace already applied
-	toolFilter   ToolFilterFunc // Optional filter for tools (applied to original name without namespace)
-	mu           sync.RWMutex
-	initialized  bool
-	era          clientEra // detected during Initialize; see tryModernInitialize
+	baseURL     string
+	httpClient  *http.Client
+	auth        AuthProvider
+	namespace   string         // Optional namespace for tool names (e.g., "scriptling.")
+	separator   string         // Separator for namespace
+	cachedTools []MCPTool      // Cached tools with namespace already applied
+	toolFilter  ToolFilterFunc // Optional filter for tools (applied to original name without namespace)
+	mu          sync.RWMutex
+	initialized bool
+	era         clientEra // detected during Initialize; see tryModernInitialize
+	// sessionID is the Legacy Mcp-Session-Id. Guarded by sessionMu rather
+	// than c.mu: it is read on every Legacy request (some of which run with
+	// c.mu held by Initialize) and rewritten when an expired session is
+	// re-initialized (see reinitializeLegacySession).
+	sessionMu    sync.Mutex
 	sessionID    string
 	instructions string // Captured from the remote server's initialize response, if any
 	// protocolVersion is the protocol revision actually in effect with this
@@ -52,6 +60,16 @@ type Client struct {
 	// Initialize has completed. See [Client.ProtocolVersion].
 	protocolVersion string
 	transport       clientTransport // non-nil for non-HTTP transports (e.g. stdio)
+
+	// nextID numbers outgoing JSON-RPC requests. Request ids MUST be unique
+	// among a client's in-flight requests, so they come from this counter
+	// rather than from the request content (two concurrent calls of the same
+	// tool would otherwise share an id).
+	nextID atomic.Int64
+
+	// probeTimeout bounds the server/discover probe on a stream transport
+	// (see Initialize); 0 means defaultStdioProbeTimeout.
+	probeTimeout time.Duration
 
 	// requestHeaders carries extra headers set at construction via
 	// WithClientRequestHeaders. Immutable once the constructor returns, so
@@ -103,19 +121,20 @@ type notifyTransport interface {
 }
 
 // batchTransport is implemented by transports that can send several requests
-// as a single wire-level batch. The stdio transport does (it is backed by
-// [jsonrpc.Client.CallBatch]); the default HTTP path does not implement it, so
-// callers fall back to concurrent individual round-trips.
+// as a single wire-level batch. The stdio transport does; the default HTTP
+// path does not implement it, so callers fall back to concurrent individual
+// round-trips. Callers use it only when the negotiated protocol revision
+// allows batching (see Client.allowsBatching).
 //
-// Responses are returned in the same order as reqs (this is the guarantee
-// [jsonrpc.Client.CallBatch] itself makes), so implementations need not
-// preserve or interpret the MCPRequest.ID field for correlation.
+// Responses are returned in the same order as reqs.
 type batchTransport interface {
 	batchRoundTrip(ctx context.Context, reqs []*MCPRequest) ([]*MCPResponse, error)
 }
 
 // Close releases resources held by the client's transport. For the default HTTP
-// transport it stops the notification reader; for a stdio subprocess transport
+// transport it stops the notification reader and, for a Legacy server that
+// assigned a session, terminates the session with an HTTP DELETE (2025-11-25
+// §Session Management, SHOULD; best effort); for a stdio subprocess transport
 // it shuts the child process down.
 func (c *Client) Close() error {
 	c.readerMu.Lock()
@@ -128,7 +147,79 @@ func (c *Client) Close() error {
 	if c.transport != nil {
 		return c.transport.Close()
 	}
+
+	c.mu.Lock()
+	protocolVersion := c.protocolVersion
+	sessionID := ""
+	if c.era == eraLegacy {
+		sessionID = c.takeSessionID()
+		c.initialized = false
+		c.cachedTools = nil
+	}
+	c.mu.Unlock()
+	if sessionID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), sessionDeleteTimeout)
+		defer cancel()
+		c.deleteSession(ctx, sessionID, protocolVersion)
+	}
 	return nil
+}
+
+// sessionDeleteTimeout bounds Close's best-effort session DELETE.
+const sessionDeleteTimeout = 5 * time.Second
+
+// getSessionID returns the current Legacy session id ("" if none).
+func (c *Client) getSessionID() string {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	return c.sessionID
+}
+
+// setSessionID replaces the Legacy session id.
+func (c *Client) setSessionID(id string) {
+	c.sessionMu.Lock()
+	c.sessionID = id
+	c.sessionMu.Unlock()
+}
+
+// takeSessionID clears the Legacy session id and returns what it was.
+func (c *Client) takeSessionID() string {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	id := c.sessionID
+	c.sessionID = ""
+	return id
+}
+
+// deleteSession explicitly terminates a Legacy session: an HTTP DELETE to
+// the MCP endpoint carrying its Mcp-Session-Id (2025-11-25 §Session
+// Management: a client that no longer needs a session SHOULD send one).
+// Best effort: errors are ignored, and so is 405, which a server that does
+// not allow clients to terminate sessions answers with.
+func (c *Client) deleteSession(ctx context.Context, sessionID, protocolVersion string) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL, nil)
+	if err != nil {
+		return
+	}
+	c.applyRequestHeaders(httpReq.Header)
+	httpReq.Header.Set("User-Agent", fmt.Sprintf("%s/%s", mcpClientName, mcpClientVersion))
+	httpReq.Header.Set(headerSessionID, sessionID)
+	if protocolVersion != "" {
+		httpReq.Header.Set(headerProtocolVersion, protocolVersion)
+	}
+	if c.applyAuthHeader(httpReq.Header) != nil {
+		return
+	}
+	if httpResp, err := c.httpClient.Do(httpReq); err == nil {
+		io.Copy(io.Discard, httpResp.Body)
+		httpResp.Body.Close()
+	}
+}
+
+// newRequestID returns a JSON-RPC request id unique among this client's
+// requests.
+func (c *Client) newRequestID() int64 {
+	return c.nextID.Add(1)
 }
 
 // ClientOption customises a Client at construction time. Applied inside
@@ -302,7 +393,25 @@ func (c *Client) Initialize(ctx context.Context) error {
 		return nil
 	}
 
-	if !c.tryModernInitialize(ctx) {
+	// On a stream transport the probe is bounded: a Legacy stdio server may
+	// simply ignore a request that arrives before initialize, and the probe
+	// must not hang on it. On timeout the Legacy handshake below still runs
+	// with the caller's own ctx.
+	probeCtx := ctx
+	if c.transport != nil {
+		timeout := c.probeTimeout
+		if timeout <= 0 {
+			timeout = defaultStdioProbeTimeout
+		}
+		var cancel context.CancelFunc
+		probeCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	modern, err := c.tryModernInitialize(probeCtx)
+	if err != nil {
+		return err
+	}
+	if !modern {
 		if err := c.initializeLegacy(ctx); err != nil {
 			return err
 		}
@@ -310,9 +419,17 @@ func (c *Client) Initialize(ctx context.Context) error {
 
 	// Start the notification reader — for Legacy, the GET SSE stream; for
 	// Modern, subscriptions/listen (see startNotifications) — only if the
-	// caller opted in via EnableNotifications. No-op for stream transports,
-	// which receive notifications via their own peer handlers regardless of
-	// era. Safe here under c.mu: startNotifications only touches readerMu.
+	// caller opted in via EnableNotifications. A Modern stream transport
+	// always subscribes (see startStreamSubscription): a 2026-07-28 server
+	// only sends list-changed notifications on a subscriptions/listen
+	// request, and the client's tool cache depends on them. Safe here under
+	// c.mu: both only touch readerMu.
+	if c.transport != nil {
+		if c.era == eraModern {
+			c.startStreamSubscription()
+		}
+		return nil
+	}
 	c.readerMu.Lock()
 	want := c.wantNotifications
 	c.readerMu.Unlock()
@@ -322,12 +439,16 @@ func (c *Client) Initialize(ctx context.Context) error {
 	return nil
 }
 
+// defaultStdioProbeTimeout bounds the Modern server/discover probe on a
+// stream transport (see Initialize and WithClientProbeTimeout).
+var defaultStdioProbeTimeout = 5 * time.Second
+
 // initializeLegacy performs the Legacy-era (2024-11-05..2025-11-25)
 // initialize handshake. Called under c.mu, held by Initialize.
 func (c *Client) initializeLegacy(ctx context.Context) error {
 	req := MCPRequest{
 		JSONRPC: "2.0",
-		ID:      "init",
+		ID:      c.newRequestID(),
 		Method:  "initialize",
 		Params: map[string]any{
 			"protocolVersion": MCPProtocolVersionLatest,
@@ -353,12 +474,12 @@ func (c *Client) initializeLegacy(ctx context.Context) error {
 
 	// Check for session ID in response headers first
 	if sessionID := respHeaders.Get(headerSessionID); sessionID != "" {
-		c.sessionID = sessionID
+		c.setSessionID(sessionID)
 	} else if resultOK {
 		// Check if the server provided a session ID in the response body
 		if sessionID, exists := result["sessionId"]; exists {
 			if sessionStr, ok := sessionID.(string); ok {
-				c.sessionID = sessionStr
+				c.setSessionID(sessionStr)
 			}
 		}
 	}
@@ -378,25 +499,36 @@ func (c *Client) initializeLegacy(ctx context.Context) error {
 	// echoes back the version it will use, which may be older than what was
 	// requested if that's the newest it supports — so this can legitimately
 	// differ from MCPProtocolVersionLatest.
-	c.protocolVersion = MCPProtocolVersionLatest
+	negotiated := MCPProtocolVersionLatest
 	if resultOK {
 		if pv, exists := result["protocolVersion"]; exists {
 			if pvStr, ok := pv.(string); ok && pvStr != "" {
-				c.protocolVersion = pvStr
+				negotiated = pvStr
 			}
 		}
 	}
 	// "If the client does not support the version in the server's response,
-	// it SHOULD disconnect" (2025-11-25 lifecycle §Version Negotiation).
-	if !isSupportedProtocolVersion(c.protocolVersion) {
-		version := c.protocolVersion
+	// it SHOULD disconnect" (2025-11-25 lifecycle §Version Negotiation):
+	// over HTTP that includes terminating the session the server just
+	// created, rather than leaving it to expire.
+	if !isSupportedProtocolVersion(negotiated) {
 		c.protocolVersion = ""
-		c.sessionID = ""
-		return fmt.Errorf("initialize failed: server negotiated protocol version %q, which this client does not support (supported: %v)", version, supportedProtocolVersions)
+		if sessionID := c.takeSessionID(); sessionID != "" && c.transport == nil {
+			c.deleteSession(ctx, sessionID, negotiated)
+		}
+		return fmt.Errorf("initialize failed: server negotiated protocol version %q, which this client does not support (supported: %v)", negotiated, supportedProtocolVersions)
+	}
+	// Assigned only when it changes: a session re-initialization (see
+	// reinitializeLegacySession) normally renegotiates the same version, and
+	// requests in flight read it without c.mu.
+	if c.protocolVersion != negotiated {
+		c.protocolVersion = negotiated
 	}
 
 	c.initialized = true
-	c.era = eraLegacy
+	if c.era != eraLegacy { // unchanged on a session re-initialization
+		c.era = eraLegacy
+	}
 
 	// The client MUST send notifications/initialized once initialize succeeds
 	// (2025-11-25 lifecycle §Initialization). Best effort: the server's
@@ -516,7 +648,7 @@ func (c *Client) ListTools(ctx context.Context) ([]MCPTool, error) {
 	}
 	c.mu.RUnlock()
 
-	pages, err := c.listPages(ctx, "list-tools", "tools/list")
+	pages, err := c.listPages(ctx, "tools/list")
 	if err != nil {
 		return nil, fmt.Errorf("list tools failed: %w", err)
 	}
@@ -581,12 +713,12 @@ const maxListPages = 1000
 // revision paginates these methods; a client that reads only the first page
 // silently misses the rest of a paginating server's list. A JSON-RPC error
 // is returned as a *ToolError.
-func (c *Client) listPages(ctx context.Context, id, method string) ([]any, error) {
+func (c *Client) listPages(ctx context.Context, method string) ([]any, error) {
 	var pages []any
 	cursor := ""
 	seen := map[string]bool{}
 	for len(pages) < maxListPages {
-		req := MCPRequest{JSONRPC: "2.0", ID: id, Method: method}
+		req := MCPRequest{JSONRPC: "2.0", ID: c.newRequestID(), Method: method}
 		if cursor != "" {
 			req.Params = map[string]any{"cursor": cursor}
 		}
@@ -596,6 +728,9 @@ func (c *Client) listPages(ctx context.Context, id, method string) ([]any, error
 		}
 		if resp.Error != nil {
 			return nil, &ToolError{Code: resp.Error.Code, Message: resp.Error.Message, Data: resp.Error.Data}
+		}
+		if err := c.checkResultType(resp.Result); err != nil {
+			return nil, err
 		}
 		pages = append(pages, resp.Result)
 
@@ -663,7 +798,7 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 
 	req := MCPRequest{
 		JSONRPC: "2.0",
-		ID:      fmt.Sprintf("call-%s", toolName),
+		ID:      c.newRequestID(),
 		Method:  "tools/call",
 		Params: map[string]any{
 			"name":      toolName,
@@ -716,16 +851,7 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 		}
 	}
 
-	var result ToolResult
-	if err := decodeResult(resp.Result, &result, "tool response"); err != nil {
-		return nil, err
-	}
-
-	return &ToolResponse{
-		Content:           result.Content,
-		StructuredContent: result.StructuredContent,
-		IsError:           result.IsError,
-	}, nil
+	return c.decodeToolResult(&resp)
 }
 
 // ListResources retrieves the list of resources from the remote server via
@@ -736,7 +862,7 @@ func (c *Client) ListResources(ctx context.Context) ([]MCPResource, error) {
 		return nil, err
 	}
 
-	pages, err := c.listPages(ctx, "list-resources", "resources/list")
+	pages, err := c.listPages(ctx, "resources/list")
 	if err != nil {
 		return nil, fmt.Errorf("list resources failed: %w", err)
 	}
@@ -762,7 +888,7 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (*ResourceRespons
 
 	req := MCPRequest{
 		JSONRPC: "2.0",
-		ID:      fmt.Sprintf("read-resource-%s", uri),
+		ID:      c.newRequestID(),
 		Method:  "resources/read",
 		Params: map[string]any{
 			"uri": uri,
@@ -782,6 +908,9 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (*ResourceRespons
 		}
 	}
 
+	if err := c.checkResultType(resp.Result); err != nil {
+		return nil, err
+	}
 	var result ResourceResponse
 	if err := decodeResult(resp.Result, &result, "resource response"); err != nil {
 		return nil, err
@@ -796,7 +925,7 @@ func (c *Client) ListResourceTemplates(ctx context.Context) ([]MCPResourceTempla
 		return nil, err
 	}
 
-	pages, err := c.listPages(ctx, "list-resource-templates", "resources/templates/list")
+	pages, err := c.listPages(ctx, "resources/templates/list")
 	if err != nil {
 		return nil, fmt.Errorf("list resource templates failed: %w", err)
 	}
@@ -820,7 +949,7 @@ func (c *Client) ListPrompts(ctx context.Context) ([]MCPPrompt, error) {
 		return nil, err
 	}
 
-	pages, err := c.listPages(ctx, "list-prompts", "prompts/list")
+	pages, err := c.listPages(ctx, "prompts/list")
 	if err != nil {
 		return nil, fmt.Errorf("list prompts failed: %w", err)
 	}
@@ -846,7 +975,7 @@ func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]str
 
 	req := MCPRequest{
 		JSONRPC: "2.0",
-		ID:      fmt.Sprintf("get-prompt-%s", name),
+		ID:      c.newRequestID(),
 		Method:  "prompts/get",
 		Params: map[string]any{
 			"name":      name,
@@ -867,6 +996,9 @@ func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]str
 		}
 	}
 
+	if err := c.checkResultType(resp.Result); err != nil {
+		return nil, err
+	}
 	var result PromptResponse
 	if err := decodeResult(resp.Result, &result, "prompt response"); err != nil {
 		return nil, err
@@ -894,6 +1026,87 @@ func (c *Client) sendRequest(ctx context.Context, req *MCPRequest, resp *MCPResp
 		return c.transport.roundTrip(ctx, req, resp, respHeaders)
 	}
 
+	sessionID := c.getSessionID()
+	err := c.sendLegacyHTTPRequest(ctx, req, resp, respHeaders)
+	if errors.Is(err, errSessionNotFound) {
+		// The server no longer knows the session: the client MUST start a
+		// new one with a fresh initialize (2025-11-25 §Session Management),
+		// then retry the original request once.
+		if reinitErr := c.reinitializeLegacySession(ctx, sessionID); reinitErr != nil {
+			return fmt.Errorf("session expired and re-initialization failed: %w", reinitErr)
+		}
+		*resp = MCPResponse{}
+		err = c.sendLegacyHTTPRequest(ctx, req, resp, respHeaders)
+	}
+	if err != nil && ctx.Err() != nil {
+		c.sendLegacyCancelled(req, ctx.Err())
+	}
+	return err
+}
+
+// errSessionNotFound is returned by sendLegacyHTTPRequest when the server
+// answers a request carrying a session id with HTTP 404: the session has
+// been terminated or has expired.
+var errSessionNotFound = errors.New("server returned status 404: session not found")
+
+// reinitializeLegacySession starts a new Legacy session after the server
+// answered 404 for staleSessionID. It takes c.mu, so it must never run under
+// it: sendRequest only reaches it for a request that carried a session id,
+// and the only request sent while Initialize holds c.mu is initialize itself,
+// which never does. When concurrent requests all see the same 404, the first
+// re-initializes and the rest find the session already replaced.
+func (c *Client) reinitializeLegacySession(ctx context.Context, staleSessionID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if current := c.getSessionID(); current != staleSessionID && current != "" {
+		return nil // another request already started a new session
+	}
+	c.setSessionID("")
+	c.initialized = false
+	c.cachedTools = nil
+	return c.initializeLegacy(ctx)
+}
+
+// sendLegacyCancelled tells a Legacy HTTP server that the caller abandoned
+// req (2025-11-25 §Cancellation): a notifications/cancelled POST, which the
+// server acknowledges with 202. Not sent for initialize, which the spec
+// forbids cancelling, nor for a request without an id. Best effort, on a
+// fresh short-lived context since the request's own is already done.
+func (c *Client) sendLegacyCancelled(req *MCPRequest, cause error) {
+	if req.ID == nil || req.Method == "initialize" {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/cancelled",
+		"params":  map[string]any{"requestId": req.ID, "reason": cause.Error()},
+	})
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cancelNotificationTimeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	c.applyLegacyHeaders(httpReq.Header, "notifications/cancelled")
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	if c.applyAuthHeader(httpReq.Header) != nil {
+		return
+	}
+	if httpResp, err := c.httpClient.Do(httpReq); err == nil {
+		io.Copy(io.Discard, httpResp.Body)
+		httpResp.Body.Close()
+	}
+}
+
+// cancelNotificationTimeout bounds a best-effort notifications/cancelled send.
+const cancelNotificationTimeout = 5 * time.Second
+
+// sendLegacyHTTPRequest performs one Legacy-era Streamable HTTP round-trip.
+func (c *Client) sendLegacyHTTPRequest(ctx context.Context, req *MCPRequest, resp *MCPResponse, respHeaders *http.Header) error {
 	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
@@ -931,6 +1144,9 @@ func (c *Client) sendRequest(ctx context.Context, req *MCPRequest, resp *MCPResp
 		*respHeaders = httpResp.Header
 	}
 
+	if httpResp.StatusCode == http.StatusNotFound && req.Method != "initialize" && httpReq.Header.Get(headerSessionID) != "" {
+		return errSessionNotFound
+	}
 	if httpResp.StatusCode != http.StatusOK {
 		return fmt.Errorf("server returned status %d", httpResp.StatusCode)
 	}
@@ -992,7 +1208,8 @@ type ParallelToolResult struct {
 
 // CallToolsParallel executes multiple tools concurrently and returns results in
 // the same order as the input. Over a transport with native batch support
-// (currently the stdio transport, backed by jsonrpc.Client.CallBatch), all
+// (currently the stdio transport) talking to a server that negotiated a
+// protocol revision with JSON-RPC batching (2024-11-05 or 2025-03-26), all
 // calls are sent as a single wire-level batch instead of one round-trip each;
 // otherwise they run as concurrent individual calls.
 func (c *Client) CallToolsParallel(ctx context.Context, calls []ToolCall) []ParallelToolResult {
@@ -1023,7 +1240,7 @@ func (c *Client) callToolsParallel(ctx context.Context, calls []ToolCall, discov
 		return results
 	}
 
-	if bt, ok := c.transport.(batchTransport); ok {
+	if bt, ok := c.transport.(batchTransport); ok && c.allowsBatching() {
 		return c.callToolsBatch(ctx, bt, calls, discovered)
 	}
 
@@ -1044,6 +1261,19 @@ func (c *Client) callToolsParallel(ctx context.Context, calls []ToolCall, discov
 	}
 	wg.Wait()
 	return results
+}
+
+// allowsBatching reports whether the negotiated protocol revision permits
+// JSON-RPC batches: only 2024-11-05 and 2025-03-26. Batching was removed in
+// 2025-06-18 and is absent from the Modern era, so a client must not send a
+// JSON array to a server speaking any later revision.
+func (c *Client) allowsBatching() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.era != eraLegacy {
+		return false
+	}
+	return c.protocolVersion == "2024-11-05" || c.protocolVersion == "2025-03-26"
 }
 
 // callToolsBatch sends every call as one wire-level batch via bt, applying the
@@ -1077,7 +1307,7 @@ func (c *Client) callToolsBatch(ctx context.Context, bt batchTransport, calls []
 		}
 		reqs[i] = &MCPRequest{
 			JSONRPC: "2.0",
-			ID:      fmt.Sprintf("batch-%d", i),
+			ID:      c.newRequestID(),
 			Method:  method,
 			Params:  params,
 		}
@@ -1127,25 +1357,28 @@ func (c *Client) callToolsBatch(ctx context.Context, bt batchTransport, calls []
 			results[i] = ParallelToolResult{Name: calls[i].Name, Err: &ToolError{Code: resp.Error.Code, Message: resp.Error.Message, Data: resp.Error.Data}}
 			continue
 		}
-		results[i] = ParallelToolResult{Name: calls[i].Name, Response: decodeToolResult(resp)}
+		toolResp, err := c.decodeToolResult(resp)
+		results[i] = ParallelToolResult{Name: calls[i].Name, Response: toolResp, Err: err}
 	}
 	return results
 }
 
 // decodeToolResult decodes a successful tools/call (or execute_tool) response
-// result into a ToolResponse. Callers must check resp.Error first. Returns
-// nil on a decode failure (its single-value contract predates error return;
-// batch callers report the nil as a missing response).
-func decodeToolResult(resp *MCPResponse) *ToolResponse {
+// result into a ToolResponse, checking a Modern result's resultType first.
+// Callers must check resp.Error first.
+func (c *Client) decodeToolResult(resp *MCPResponse) (*ToolResponse, error) {
+	if err := c.checkResultType(resp.Result); err != nil {
+		return nil, err
+	}
 	var result ToolResult
 	if err := decodeResult(resp.Result, &result, "tool response"); err != nil {
-		return nil
+		return nil, err
 	}
 	return &ToolResponse{
 		Content:           result.Content,
 		StructuredContent: result.StructuredContent,
 		IsError:           result.IsError,
-	}
+	}, nil
 }
 
 // ExecuteDiscoveredTool executes a tool by name using the execute_tool MCP tool.

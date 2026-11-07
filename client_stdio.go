@@ -6,20 +6,40 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/paularlott/jsonrpc"
 )
 
 // stdioTransport implements clientTransport over a newline-delimited JSON-RPC
-// stream using the jsonrpc client. It backs both an in-process stream client
-// and a spawned subprocess client.
+// stream. It backs both an in-process stream client and a spawned subprocess
+// client.
+//
+// When peer is set (every client built by NewStdioClient/NewStreamClient),
+// requests go through the peer directly with the client's own request ids
+// (jsonrpc.Peer implements jsonrpc.Transport), so the client knows each
+// request's wire id: it needs it to send notifications/cancelled for an
+// abandoned request and to correlate a subscriptions/listen subscription.
+// Without a peer (newStreamClient over a bare jsonrpc.Client) the
+// jsonrpc.Client assigns ids itself and neither is possible.
 type stdioTransport struct {
-	rpc *jsonrpc.Client
+	rpc  *jsonrpc.Client
+	peer *jsonrpc.Peer
 }
+
+// cancelledNotifyTimeout bounds a best-effort notifications/cancelled write.
+const cancelledNotifyTimeout = 2 * time.Second
 
 func (t *stdioTransport) roundTrip(ctx context.Context, req *MCPRequest, resp *MCPResponse, respHeaders *http.Header) error {
 	resp.JSONRPC = "2.0"
 	resp.ID = req.ID
+	if respHeaders != nil {
+		*respHeaders = http.Header{}
+	}
+
+	if t.peer != nil && req.ID != nil {
+		return t.peerRoundTrip(ctx, req, resp)
+	}
 
 	var result json.RawMessage
 	err := t.rpc.Call(ctx, req.Method, req.Params, &result)
@@ -31,18 +51,73 @@ func (t *stdioTransport) roundTrip(ctx context.Context, req *MCPRequest, resp *M
 		}
 		return err
 	}
+	return decodeRawResult(result, resp)
+}
 
-	if len(result) > 0 {
-		var v any
-		if err := json.Unmarshal(result, &v); err != nil {
+// peerRoundTrip sends req through the peer with req.ID as its wire id. If ctx
+// ends before the response arrives, the server is told with
+// notifications/cancelled (2025-11-25 and 2026-07-28 §Cancellation; on stdio
+// that notification is the only cancellation signal). initialize is never
+// cancelled, as the spec requires.
+func (t *stdioTransport) peerRoundTrip(ctx context.Context, req *MCPRequest, resp *MCPResponse) error {
+	id, err := json.Marshal(req.ID)
+	if err != nil {
+		return err
+	}
+	var params json.RawMessage
+	if req.Params != nil {
+		if params, err = json.Marshal(req.Params); err != nil {
 			return err
 		}
-		resp.Result = v
 	}
-	if respHeaders != nil {
-		*respHeaders = http.Header{}
+	r, err := t.peer.Call(ctx, &jsonrpc.Request{
+		JSONRPC: json.RawMessage(`"2.0"`),
+		Method:  req.Method,
+		Params:  params,
+		ID:      id,
+	})
+	if err != nil {
+		if ctx.Err() != nil && req.Method != "initialize" {
+			t.sendCancelled(req.ID, ctx.Err())
+		}
+		return err
 	}
+	if r.Error != nil {
+		resp.Error = &MCPError{Code: r.Error.Code, Message: r.Error.Message, Data: r.Error.Data}
+		return nil
+	}
+	return decodeRawResult(r.Result, resp)
+}
+
+// sendCancelled notifies the server that the request with id was abandoned.
+// Best effort, on its own short-lived context: the request's is already done.
+func (t *stdioTransport) sendCancelled(id any, cause error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cancelledNotifyTimeout)
+	defer cancel()
+	_ = t.rpc.Notify(ctx, "notifications/cancelled", map[string]any{
+		"requestId": id,
+		"reason":    cause.Error(),
+	})
+}
+
+// decodeRawResult decodes a JSON-RPC result into resp.Result (left nil for an
+// absent or null result).
+func decodeRawResult(result json.RawMessage, resp *MCPResponse) error {
+	if len(result) == 0 {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(result, &v); err != nil {
+		return err
+	}
+	resp.Result = v
 	return nil
+}
+
+// receivesNotifications reports whether inbound server messages reach the
+// client: only over a peer, whose handlers dispatch them.
+func (t *stdioTransport) receivesNotifications() bool {
+	return t.peer != nil
 }
 
 func (t *stdioTransport) notify(ctx context.Context, method string, params any) error {
@@ -54,9 +129,14 @@ func (t *stdioTransport) Close() error {
 }
 
 // batchRoundTrip implements batchTransport by sending every request as a
-// single JSON-RPC batch via jsonrpc.Client.CallBatch. Results are returned in
-// the same order as reqs (CallBatch's own guarantee).
+// single JSON-RPC batch. Results are returned in the same order as reqs. Over
+// a peer the batch carries the client's own request ids; otherwise
+// jsonrpc.Client.CallBatch assigns them. Only used for protocol revisions
+// that allow batching (see Client.allowsBatching).
 func (t *stdioTransport) batchRoundTrip(ctx context.Context, reqs []*MCPRequest) ([]*MCPResponse, error) {
+	if t.peer != nil {
+		return t.peerBatchRoundTrip(ctx, reqs)
+	}
 	calls := make([]jsonrpc.BatchCall, len(reqs))
 	raws := make([]json.RawMessage, len(reqs))
 	for i, req := range reqs {
@@ -75,12 +155,43 @@ func (t *stdioTransport) batchRoundTrip(ctx context.Context, reqs []*MCPRequest)
 			} else {
 				return nil, err
 			}
-		} else if len(raws[i]) > 0 {
-			var v any
-			if err := json.Unmarshal(raws[i], &v); err != nil {
-				return nil, err
+		} else if err := decodeRawResult(raws[i], resp); err != nil {
+			return nil, err
+		}
+		resps[i] = resp
+	}
+	return resps, nil
+}
+
+func (t *stdioTransport) peerBatchRoundTrip(ctx context.Context, reqs []*MCPRequest) ([]*MCPResponse, error) {
+	wire := make([]*jsonrpc.Request, len(reqs))
+	for i, req := range reqs {
+		id, err := json.Marshal(req.ID)
+		if err != nil {
+			return nil, err
+		}
+		params, err := json.Marshal(req.Params)
+		if err != nil {
+			return nil, err
+		}
+		wire[i] = &jsonrpc.Request{JSONRPC: json.RawMessage(`"2.0"`), Method: req.Method, Params: params, ID: id}
+	}
+	got, err := t.peer.CallBatch(ctx, wire)
+	if err != nil {
+		if ctx.Err() != nil {
+			for _, req := range reqs {
+				t.sendCancelled(req.ID, ctx.Err())
 			}
-			resp.Result = v
+		}
+		return nil, err
+	}
+	resps := make([]*MCPResponse, len(reqs))
+	for i, req := range reqs {
+		resp := &MCPResponse{JSONRPC: "2.0", ID: req.ID}
+		if got[i].Error != nil {
+			resp.Error = &MCPError{Code: got[i].Error.Code, Message: got[i].Error.Message, Data: got[i].Error.Data}
+		} else if err := decodeRawResult(got[i].Result, resp); err != nil {
+			return nil, err
 		}
 		resps[i] = resp
 	}
@@ -96,6 +207,18 @@ type stdioClientConfig struct {
 	extraEnv []string
 	dir      string
 	onExit   func(error)
+	// probeTimeout bounds the Modern server/discover probe (see
+	// WithClientProbeTimeout); 0 means defaultStdioProbeTimeout.
+	probeTimeout time.Duration
+}
+
+// WithClientProbeTimeout bounds how long Initialize waits for the server's
+// answer to the Modern-era server/discover probe before falling back to the
+// Legacy initialize handshake (default 5s). A Legacy stdio server may ignore
+// a request it receives before initialize instead of answering it with an
+// error; without the bound the probe would wait for it forever.
+func WithClientProbeTimeout(d time.Duration) StdioClientOption {
+	return func(c *stdioClientConfig) { c.probeTimeout = d }
 }
 
 // WithClientStderr routes the child server's standard error to w (default:
@@ -178,7 +301,9 @@ func NewStdioClient(command string, args []string, namespace string, opts ...Std
 	if err != nil {
 		return nil, err
 	}
-	return newPeerClient(peer, namespace), nil
+	c := newPeerClient(peer, namespace)
+	c.probeTimeout = cfg.probeTimeout
+	return c, nil
 }
 
 // NewStreamClient returns an MCP client that speaks newline-delimited JSON-RPC
@@ -218,9 +343,14 @@ func newPeerClient(peer *jsonrpc.Peer, namespace string) *Client {
 	c := &Client{
 		namespace: namespace,
 		separator: separator,
-		transport: &stdioTransport{rpc: peer.Client()},
+		transport: &stdioTransport{rpc: peer.Client(), peer: peer},
 	}
 	registerPeerNotificationHandlers(peer, c)
+	// A server may ping the client at any time, and the receiver MUST answer
+	// promptly with an empty result (2025-11-25 §Ping).
+	peer.Handle("ping", func(ctx context.Context, params json.RawMessage) (any, error) {
+		return map[string]any{}, nil
+	})
 	return c
 }
 

@@ -3,7 +3,11 @@
 The MCP library supports every MCP protocol revision from 2024-11-05 through the
 current 2026-07-28, across two distinct eras, on both `Server` and `Client`, over
 both HTTP and stdio. Detection and behavior selection are automatic — there is no
-configuration required to get this.
+configuration required to get this. (One transport exception: the `Client`
+speaks 2024-11-05 over Streamable HTTP and stdio only. The separate HTTP+SSE
+transport that 2024-11-05 originally defined — a `GET` stream announcing a POST
+URL in an `endpoint` event — is not implemented, so a server that offers only
+that transport cannot be reached over HTTP.)
 
 ## Legacy and Modern
 
@@ -36,13 +40,29 @@ Modern-era code path, and vice versa.
 A `Client` detects which era its server speaks the first time `Initialize` runs:
 it attempts a Modern `server/discover` call first, and falls back to the Legacy
 `initialize` handshake if that doesn't succeed (per the spec's own documented
-backward-compatibility algorithm). Every other `Client` method — `ListTools`,
-`CallTool`, `ReadResource`, and so on — is completely unaffected by which era was
-detected; they call the same private helper either way.
+backward-compatibility algorithm). It falls back on a transport error, a
+non-JSON or empty body, `404`/`405`, or a JSON-RPC error such as Method not
+found. A recognized Modern error proves the server is Modern, so it does not
+fall back but returns the error from `Initialize`: `HeaderMismatch` (-32020),
+`MissingRequiredClientCapability` (-32021), or `UnsupportedProtocolVersion`
+(-32022) whose `data.supported` lists a Modern revision the client could not
+use (it first retries once with a listed version it can speak). An
+`UnsupportedProtocolVersion` listing only Legacy revisions falls back to
+`initialize`. Over stdio the probe is bounded (5s by default,
+`WithClientProbeTimeout`), because a Legacy stdio server may ignore a request
+that arrives before `initialize`; on timeout the client cancels the probe and
+runs `initialize`. Every other `Client` method — `ListTools`, `CallTool`,
+`ReadResource`, and so on — is completely unaffected by which era was detected;
+they call the same private helper either way.
+
+Every Modern result's `resultType` is checked: absent or `complete` is a final
+result, `input_required` returns `ErrInputRequired` (the client implements no
+Multi Round-Trip Requests input: sampling, elicitation, roots), and any other
+value is an invalid-result error.
 
 ## Supported Protocol Versions
 
-- **2024-11-05** (Legacy, minimum supported)
+- **2024-11-05** (Legacy, minimum supported; `Client`: Streamable HTTP and stdio only)
 - **2025-03-26** (Legacy)
 - **2025-06-18** (Legacy)
 - **2025-11-25** (Legacy, latest)
@@ -228,7 +248,26 @@ notification handlers in order. Legacy era only: a server-to-client request
 on the stream is answered (`ping` with an empty result, anything else with
 Method not found), and a stream that closes after an event id is resumed with
 `GET` + `Last-Event-ID` after the server's `retry` delay (bounded retries).
-Cancelling the call's context closes the stream.
+Cancelling the call's context closes the stream; in the Legacy era the client
+also sends `notifications/cancelled` with the request id (Modern HTTP needs no
+notification: closing the stream is the cancellation). Over stdio a cancelled
+request is always followed by `notifications/cancelled`. `initialize` is never
+cancelled.
+
+**Client, other Legacy HTTP behaviour.** Request ids come from a per-client
+counter, so concurrent calls never share one. A `404` to a request carrying an
+`MCP-Session-Id` means the session ended: the client runs `initialize` again
+and retries the request once. `Close` ends the session with a best-effort
+`DELETE` (a `405` is fine), as does an `initialize` whose negotiated version
+the client cannot speak. The notification `GET` stream (`EnableNotifications`)
+waits at least the server's `retry` before reconnecting, sends `Last-Event-ID`
+when it reconnects, answers a server `ping` on the stream, and stops for good
+on `405` (the server offers no stream).
+
+**Client, stdio.** A server `ping` is answered with an empty result.
+`CallToolsParallel` sends one JSON-RPC batch only when the negotiated revision
+allows batching (2024-11-05, 2025-03-26); for later revisions, Modern
+included, it sends concurrent individual requests.
 
 ## Version Negotiation (Legacy)
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,27 +26,29 @@ const (
 // tryModernInitialize attempts the Modern-era (protocol revision 2026-07-28+)
 // discovery probe described in the spec's backward-compatibility algorithm:
 // send server/discover in the Modern shape and see whether the server
-// understands it. Returns true only when Modern era was fully detected and
-// applied (c.initialized, c.era, and c.protocolVersion are set); false means
-// "could not confirm Modern support" for any reason (network error, non-JSON
-// body, or a Legacy server's plain error) and the caller should fall back to
-// the existing Legacy c.initializeLegacy, unchanged.
+// understands it. modern=true means Modern era was fully detected and
+// applied (c.initialized, c.era, and c.protocolVersion are set);
+// modern=false with a nil error means "could not confirm Modern support"
+// (network error, non-JSON body, 404/405, or a Legacy server's plain error
+// such as Method not found) and the caller should fall back to the Legacy
+// c.initializeLegacy, unchanged.
 //
 // A server that answers with a well-formed Modern protocol error — code
 // [ErrorCodeUnsupportedProtocolVersion], naming the versions it does
 // support in data.supported — has just proven it understands the Modern
 // wire format; it isn't a Legacy server at all, it simply doesn't support
 // [MCPProtocolVersionModern] specifically (e.g. it only speaks a newer
-// revision this client build predates). Falling back to Legacy in that case
-// would be wrong and would just fail again against a server that likely
-// doesn't implement the Legacy initialize handshake either. So this retries
-// server/discover once, using a version drawn from the server's own
-// data.supported list, before giving up on Modern.
+// revision this client build predates). So this retries server/discover
+// once, using a version drawn from the server's own data.supported list.
 //
-// This never returns an error itself: a failed probe is not a fatal
-// condition, it just means "assume Legacy" — if the server is genuinely
-// unreachable, the subsequent Legacy attempt will surface that error itself.
-func (c *Client) tryModernInitialize(ctx context.Context) bool {
+// A recognized Modern error the client cannot recover from returns err:
+// HeaderMismatch, MissingRequiredClientCapability, or UnsupportedProtocolVersion
+// whose supported list names Modern revisions none of which worked. Such a
+// server speaks a Modern version and the client must not fall back to
+// initialize (2026-07-28 Streamable HTTP §Backward Compatibility).
+// UnsupportedProtocolVersion listing only Legacy revisions is the one Modern
+// error that does mean "use initialize", and falls back as before.
+func (c *Client) tryModernInitialize(ctx context.Context) (modern bool, err error) {
 	probeVersion := MCPProtocolVersionModern
 	for attempt := 0; attempt < 2; attempt++ {
 		// c.protocolVersion drives the _meta/header version withModernMeta
@@ -57,7 +60,7 @@ func (c *Client) tryModernInitialize(ctx context.Context) bool {
 
 		discoverReq := c.withModernMeta(&MCPRequest{
 			JSONRPC: "2.0",
-			ID:      "discover",
+			ID:      c.newRequestID(),
 			Method:  "server/discover",
 			Params:  map[string]any{},
 		})
@@ -71,7 +74,7 @@ func (c *Client) tryModernInitialize(ctx context.Context) bool {
 		}
 		if err != nil {
 			c.protocolVersion = ""
-			return false
+			return false, nil
 		}
 		if resp.Error != nil {
 			if attempt == 0 && resp.Error.Code == ErrorCodeUnsupportedProtocolVersion {
@@ -81,13 +84,17 @@ func (c *Client) tryModernInitialize(ctx context.Context) bool {
 				}
 			}
 			c.protocolVersion = ""
-			return false
+			if isFatalModernProbeError(resp.Error) {
+				return false, fmt.Errorf("initialize failed: server speaks the Modern protocol but rejected server/discover: %w",
+					&ToolError{Code: resp.Error.Code, Message: resp.Error.Message, Data: resp.Error.Data})
+			}
+			return false, nil
 		}
 
 		result, ok := resp.Result.(map[string]any)
 		if !ok {
 			c.protocolVersion = ""
-			return false
+			return false, nil
 		}
 		// A real DiscoverResult always carries supportedVersions (spec-required).
 		// Require it explicitly rather than accepting any success envelope, so a
@@ -95,7 +102,7 @@ func (c *Client) tryModernInitialize(ctx context.Context) bool {
 		// mistaken for a Modern one.
 		if _, ok := result["supportedVersions"]; !ok {
 			c.protocolVersion = ""
-			return false
+			return false, nil
 		}
 
 		c.era = eraModern
@@ -106,10 +113,67 @@ func (c *Client) tryModernInitialize(ctx context.Context) bool {
 			c.instructions = instructions
 		}
 		c.initialized = true
-		return true
+		return true, nil
 	}
 	c.protocolVersion = ""
+	return false, nil
+}
+
+// isFatalModernProbeError reports whether a server/discover error proves the
+// server speaks the Modern era, so the client must not fall back to the
+// Legacy initialize handshake: HeaderMismatch, MissingRequiredClientCapability,
+// or UnsupportedProtocolVersion whose data.supported names at least one
+// Modern-era revision (one the probe could not use, or it would have been
+// retried). An UnsupportedProtocolVersion listing only Legacy revisions (or
+// with no supported list, so not a recognized Modern error) falls back, as
+// does every other code (e.g. -32601 from a Legacy server).
+func isFatalModernProbeError(e *MCPError) bool {
+	switch e.Code {
+	case ErrorCodeHeaderMismatch, ErrorCodeMissingRequiredClientCapability:
+		return true
+	case ErrorCodeUnsupportedProtocolVersion:
+		m, _ := e.Data.(map[string]any)
+		supported, _ := m["supported"].([]any)
+		for _, v := range supported {
+			if s, ok := v.(string); ok && s >= MCPProtocolVersionModern {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+// ErrInputRequired is returned when a Modern-era server answers a request
+// with resultType "input_required": it needs input from the client
+// (sampling, elicitation or roots, via Multi Round-Trip Requests) before it
+// can complete the request. This client implements none of those, so it
+// cannot continue the exchange.
+var ErrInputRequired = errors.New("server requires client input (resultType \"input_required\"): multi round-trip requests are not supported by this client")
+
+// checkResultType validates a Modern-era result's resultType (2026-07-28):
+// absent or "complete" is a final result; "input_required" is
+// [ErrInputRequired]; anything else is an invalid result. Legacy results
+// carry no resultType and are never checked.
+func (c *Client) checkResultType(result any) error {
+	if c.era != eraModern {
+		return nil
+	}
+	m, ok := result.(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, present := m["resultType"]
+	if !present {
+		return nil
+	}
+	switch rt, _ := raw.(string); rt {
+	case "complete":
+		return nil
+	case "input_required":
+		return ErrInputRequired
+	default:
+		return fmt.Errorf("invalid result: unknown resultType %v", raw)
+	}
 }
 
 // pickRetryModernVersion extracts a version to retry server/discover with
@@ -290,19 +354,10 @@ func (c *Client) sendModernHTTPRequest(ctx context.Context, req *MCPRequest, res
 // Legacy constant handleNotification already knows, so cache invalidation
 // and the On*Changed callbacks work identically regardless of which era
 // delivered the event.
-func (c *Client) connectModernSubscription(ctx context.Context) (*http.Response, func(string) (string, bool), error) {
-	req := c.withModernMeta(&MCPRequest{
-		JSONRPC: "2.0",
-		ID:      "subscribe",
-		Method:  "subscriptions/listen",
-		Params: map[string]any{
-			"notifications": map[string]any{
-				"toolsListChanged":     true,
-				"resourcesListChanged": true,
-				"promptsListChanged":   true,
-			},
-		},
-	})
+//
+// lastEventID is ignored: 2026-07-28 streams are not resumable.
+func (c *Client) connectModernSubscription(ctx context.Context, lastEventID string) (*http.Response, func(string) (string, bool), error) {
+	req := c.withModernMeta(c.listenRequest())
 	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return nil, nil, err
@@ -323,6 +378,24 @@ func (c *Client) connectModernSubscription(ctx context.Context) (*http.Response,
 
 	resp, err := c.httpClient.Do(httpReq)
 	return resp, translateModernNotification, err
+}
+
+// listenRequest builds a (pre-_meta) subscriptions/listen request subscribed
+// to every list-changed type, matching the Legacy reader's receive-everything
+// behaviour. Shared by the HTTP reader and the stdio subscription.
+func (c *Client) listenRequest() *MCPRequest {
+	return &MCPRequest{
+		JSONRPC: "2.0",
+		ID:      c.newRequestID(),
+		Method:  "subscriptions/listen",
+		Params: map[string]any{
+			"notifications": map[string]any{
+				"toolsListChanged":     true,
+				"resourcesListChanged": true,
+				"promptsListChanged":   true,
+			},
+		},
+	}
 }
 
 // translateModernNotification drops the subscription acknowledgement for the
