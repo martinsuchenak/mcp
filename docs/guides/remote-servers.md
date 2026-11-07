@@ -412,6 +412,92 @@ auth := mcp.NewOAuth2Auth(
 )
 ```
 
+Pass `mcp.WithResource(resourceURL)` to send the RFC 8707 `resource`
+parameter in every token request.
+
+### Authorization (OAuth 2.1)
+
+For servers that need a user's authorization, the library implements the
+client side of the
+[MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+up to the browser step, which is left to your application.
+
+**Discovery.** `mcp.DiscoverOAuthMeta(ctx, serverURL)` (or
+`DiscoverOAuthMetaWithClient` with your own `*http.Client`) finds the
+authorization server:
+
+1. Protected resource metadata (RFC 9728): the `resource_metadata` of the
+   server's 401 `WWW-Authenticate: Bearer` challenge (an unauthenticated GET,
+   then a JSON-RPC `ping` POST for servers that only take POST), then
+   `/.well-known/oauth-protected-resource/<path>`, then
+   `/.well-known/oauth-protected-resource`. A document for another resource
+   is ignored.
+2. The authorization server's metadata, for an issuer with a path, at
+   `/.well-known/oauth-authorization-server/<path>`, then
+   `/.well-known/openid-configuration/<path>`, then
+   `<issuer>/.well-known/openid-configuration`. Its `issuer` must match exactly.
+3. Only when the server publishes no protected resource metadata: metadata
+   at the root of the server's own host, whose `issuer` must be the server's
+   origin (servers that are their own authorization server).
+
+All metadata and discovery URLs must be `https` (`http` is accepted only for
+loopback hosts). The authorization server must advertise PKCE `S256` in
+`code_challenge_methods_supported`; otherwise discovery fails with
+`mcp.ErrPKCENotSupported`, and the client must not proceed.
+
+The returned `OAuthMeta` gives what the authorization flow needs:
+
+- `Resource`: send it as `resource=` in **both** the authorization request
+  and the token request, so the token is issued for this server.
+- Scopes: ask for `ChallengeScope` (the 401 challenge's `scope`) when set,
+  else `ResourceScopesSupported` (from the protected resource metadata), else
+  leave `scope` out; `ScopesSupported` lists the authorization server's.
+- `ClientIDMetadataDocumentSupported` and
+  `AuthorizationResponseIssParameterSupported` (check `iss` against `Issuer`
+  when set).
+
+```go
+meta, err := mcp.DiscoverOAuthMeta(ctx, "https://api.example.com/mcp")
+if err != nil {
+    return err // includes errors.Is(err, mcp.ErrPKCENotSupported)
+}
+
+// Without a pre-registered client, register one (RFC 7591). application_type
+// is "native" for a loopback or custom-scheme redirect URI, else "web";
+// override with mcp.WithApplicationType.
+clientID, err := mcp.RegisterOAuthClient(ctx, meta.RegistrationEndpoint,
+    "my-app", "http://127.0.0.1:8765/callback")
+
+// ... run the browser authorization code flow with PKCE S256 against
+// meta.AuthorizationEndpoint and meta.TokenEndpoint, sending
+// resource=meta.Resource in both requests ...
+
+auth := mcp.NewOAuth2RefreshTokenAuth(meta.TokenEndpoint, clientID,
+    accessToken, refreshToken, mcp.WithResource(meta.Resource))
+client := mcp.NewClient("https://api.example.com/mcp", auth, "namespace")
+```
+
+`RegisterOAuthClientWithClient` takes your own `*http.Client`. A
+registration answered with anything but 2xx is an error naming the server's
+`error` and `error_description`.
+
+### Protecting your server
+
+The library does not provide resource server helpers. An MCP server that
+requires authorization must:
+
+- answer unauthenticated requests with `401` and
+  `WWW-Authenticate: Bearer resource_metadata="https://host/.well-known/oauth-protected-resource/mcp"`
+  (optionally with `scope="..."`);
+- serve its protected resource metadata at
+  `/.well-known/oauth-protected-resource[/path]`, with `resource` set to its
+  own URL and `authorization_servers` naming its authorization server;
+- validate every token, including that its audience is this server;
+- answer a token lacking a required scope with `403` and
+  `WWW-Authenticate: Bearer error="insufficient_scope", scope="..."`;
+- never forward the token it received to upstream services: obtain a
+  separate token for them.
+
 ## Unified Interface Benefits
 
 - Single endpoint for multiple tool libraries

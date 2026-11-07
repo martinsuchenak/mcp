@@ -28,10 +28,11 @@ func authServer(t *testing.T, oauthWellKnown bool, issuerOverride string) (*http
 			issuer = issuerOverride
 		}
 		_ = json.NewEncoder(w).Encode(OAuthMeta{
-			Issuer:                issuer,
-			AuthorizationEndpoint: ts.URL + "/o/org-1/oauth/authorize",
-			TokenEndpoint:         ts.URL + "/o/org-1/oauth/token",
-			RegistrationEndpoint:  ts.URL + "/o/org-1/oauth/register",
+			Issuer:                        issuer,
+			AuthorizationEndpoint:         ts.URL + "/o/org-1/oauth/authorize",
+			TokenEndpoint:                 ts.URL + "/o/org-1/oauth/token",
+			RegistrationEndpoint:          ts.URL + "/o/org-1/oauth/register",
+			CodeChallengeMethodsSupported: []string{"S256"},
 		})
 	}))
 	t.Cleanup(ts.Close)
@@ -133,29 +134,68 @@ func TestCoversResource(t *testing.T) {
 	}
 }
 
-// A server that is its own authorization server is found as before, even when it also publishes protected resource
-// metadata, and needs no resource.
-func TestDiscoverOAuthMeta_OwnAuthorizationServerFirst(t *testing.T) {
-	_, issuer := authServer(t, true, "")
+// legacyServer is an MCP server at /mcp that is its own authorization server, publishing its metadata at the root of
+// its host with issuer ("{origin}" standing for its own origin), and, when protectedBy is set, protected resource
+// metadata naming the authorization server protectedBy.
+func legacyServer(t *testing.T, issuer, protectedBy string) *httptest.Server {
+	t.Helper()
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/oauth-authorization-server":
-			_ = json.NewEncoder(w).Encode(OAuthMeta{AuthorizationEndpoint: ts.URL + "/authorize", TokenEndpoint: ts.URL + "/token"})
+			_ = json.NewEncoder(w).Encode(OAuthMeta{
+				Issuer:                        strings.ReplaceAll(issuer, "{origin}", ts.URL),
+				AuthorizationEndpoint:         ts.URL + "/authorize",
+				TokenEndpoint:                 ts.URL + "/token",
+				CodeChallengeMethodsSupported: []string{"S256"},
+			})
 		case "/.well-known/oauth-protected-resource":
-			_ = json.NewEncoder(w).Encode(map[string]any{"resource": ts.URL + "/mcp", "authorization_servers": []string{issuer}})
+			if protectedBy == "" {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"resource": ts.URL + "/mcp", "authorization_servers": []string{protectedBy}})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
-	defer ts.Close()
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// A server publishing both protected resource metadata and authorization server metadata of its own is found through
+// its protected resource metadata: RFC 9728 first, as the MCP authorization spec requires.
+func TestDiscoverOAuthMeta_ProtectedResourceWinsOverOwnAuthorizationServer(t *testing.T) {
+	as, issuer := authServer(t, true, "")
+	ts := legacyServer(t, "{origin}", issuer)
 
 	meta, err := DiscoverOAuthMeta(context.Background(), ts.URL+"/mcp")
 	if err != nil {
 		t.Fatalf("DiscoverOAuthMeta: %v", err)
 	}
-	if meta.TokenEndpoint != ts.URL+"/token" || meta.Resource != "" {
+	if meta.TokenEndpoint != as.URL+"/o/org-1/oauth/token" || meta.Resource != ts.URL+"/mcp" {
 		t.Errorf("meta = %+v", meta)
+	}
+}
+
+// A server publishing no protected resource metadata, only authorization server metadata of its own (the legacy
+// fallback), is found when that metadata's issuer is exactly its origin, with its own URL as the resource.
+func TestDiscoverOAuthMeta_OwnAuthorizationServerFallback(t *testing.T) {
+	ts := legacyServer(t, "{origin}", "")
+	meta, err := DiscoverOAuthMeta(context.Background(), ts.URL+"/mcp/")
+	if err != nil {
+		t.Fatalf("DiscoverOAuthMeta: %v", err)
+	}
+	if meta.TokenEndpoint != ts.URL+"/token" || meta.Resource != ts.URL+"/mcp" {
+		t.Errorf("meta = %+v", meta)
+	}
+
+	for _, issuer := range []string{"https://impostor.example", "{origin}/", "{origin}/mcp", ""} {
+		other := legacyServer(t, issuer, "")
+		_, err := DiscoverOAuthMeta(context.Background(), other.URL+"/mcp")
+		if err == nil || !strings.Contains(err.Error(), "is for another issuer") {
+			t.Errorf("issuer %q: error = %v, want it refused as another issuer", issuer, err)
+		}
 	}
 }
 
