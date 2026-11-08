@@ -90,6 +90,10 @@ type ToolError struct {
 	Code    int
 	Message string
 	Data    any
+
+	// invalidArguments marks the arguments failing the tool's input
+	// schema: tools/call reports it as a tool execution error.
+	invalidArguments bool
 }
 
 func (e *ToolError) Error() string {

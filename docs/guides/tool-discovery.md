@@ -156,8 +156,19 @@ func (p *MyProvider) GetTools(ctx context.Context) ([]mcp.MCPTool, error) {
 
 1. **Initialize with minimal context**: Only essential tools + `tool_search`/`execute_tool` visible
 2. **Search for needed tools**: `tool_search(query="email")` → finds "send_email" with full schema
-3. **Execute discovered tool**: `execute_tool(name="send_email", arguments={...})` → executes the tool
+3. **Execute discovered tool**: `execute_tool(name="send_email", parameters={...})` → executes the tool
 4. **Repeat as needed**: LLM can search for different tools as needed
+
+### execute_tool arguments
+
+`execute_tool` takes `name` (the exact tool name) and `parameters` (the
+tool's arguments). `parameters` may be an object or a string holding a JSON
+object; `arguments` is accepted in its place for backward compatibility.
+Anything else is refused with a tool execution error (`isError: true`) that
+says what to send — an unknown key, a `parameters` value that isn't an
+object, or both `parameters` and `arguments` — so the target tool never runs
+with arguments other than those sent. The target's own input schema then
+applies as for a direct call. `tool_search` refuses unknown keys the same way.
 
 ## Example Implementation
 

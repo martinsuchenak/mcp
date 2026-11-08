@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,18 +183,27 @@ func (s *Server) SetSessionManager(manager SessionManager) {
 	s.sessionManager = manager
 }
 
-// getDiscoveryTools returns the discovery tools (tool_search, execute_tool) as MCPTool structs.
-// These are generated dynamically, not stored in nativeToolCache.
-func (s *Server) getDiscoveryTools() []MCPTool {
-	toolSearch := NewTool(ToolSearchName, "Search the tools available on this MCP server, including ones hidden from the initial tool list, by name, description, or keyword. Returns matching tools with their names, descriptions, input schemas, and relevance scores (0.0 to 1.0, where 1.0 is an exact match and higher scores indicate better relevance). Call execute_tool on this MCP server with the exact name to execute a match. Omit query to list all tools available on this server.",
+// toolSearchTool and executeToolTool define the discovery meta-tools; their
+// schemas are both advertised in tools/list and enforced on each call.
+func toolSearchTool() *ToolBuilder {
+	return NewTool(ToolSearchName, "Search the tools available on this MCP server, including ones hidden from the initial tool list, by name, description, or keyword. Returns matching tools with their names, descriptions, input schemas, and relevance scores (0.0 to 1.0, where 1.0 is an exact match and higher scores indicate better relevance). Call execute_tool on this MCP server with the exact name to execute a match. Omit query to list all tools available on this server.",
 		String("query", "Search query to find relevant tools (searches name, description, and keywords). Omit to list all tools available on this server."),
 		Number("max_results", "Maximum number of results to return (default: 5)"),
 	)
+}
 
-	executeTool := NewTool(ExecuteToolName, "Execute a tool on this MCP server that was found via tool_search but may not appear in this server's tool list.",
+func executeToolTool() *ToolBuilder {
+	return NewTool(ExecuteToolName, "Execute a tool on this MCP server that was found via tool_search but may not appear in this server's tool list.",
 		String("name", "The exact name of the tool to execute (must be a tool found via tool_search)", Required()),
 		Object("parameters", "The parameters to pass to the tool (matching the schema from tool_search results)"),
 	)
+}
+
+// getDiscoveryTools returns the discovery tools (tool_search, execute_tool) as MCPTool structs.
+// These are generated dynamically, not stored in nativeToolCache.
+func (s *Server) getDiscoveryTools() []MCPTool {
+	toolSearch := toolSearchTool()
+	executeTool := executeToolTool()
 
 	discoveryTools := []MCPTool{
 		{
@@ -216,6 +226,9 @@ func (s *Server) getDiscoveryTools() []MCPTool {
 // as well as native tools that are already in tools/list.
 // If remote MCP servers expose tool_search, it delegates to them and prefixes results.
 func (s *Server) handleToolSearch(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
+	if err := validateRequiredParameters(toolSearchTool().BuildSchema(), req.Args()); err != nil {
+		return nil, err
+	}
 	query := req.StringOr("query", "")
 	maxResults := req.IntOr("max_results", 5)
 	if maxResults <= 0 {
@@ -280,31 +293,69 @@ func (s *Server) handleToolSearch(ctx context.Context, req *ToolRequest) (*ToolR
 	return NewToolResponseJSON(results), nil
 }
 
-// handleExecuteTool handles the execute_tool meta-tool execution
+// handleExecuteTool handles the execute_tool meta-tool execution. Its own
+// arguments are checked like any tool's: a request it cannot read is refused
+// with a tool execution error, never run with empty arguments.
 func (s *Server) handleExecuteTool(ctx context.Context, req *ToolRequest) (*ToolResponse, error) {
-	name, err := req.String("name")
-	if err != nil || name == "" {
-		return NewToolResponseText("Tool name is required"), nil
-	}
-
-	args, _ := req.Object("parameters")
-	if args == nil {
-		// Fallback: accept "arguments" for backward compatibility
-		args, _ = req.Object("arguments")
-	}
-	if args == nil {
-		args = make(map[string]any)
+	name, args, err := executeToolArguments(req.Args())
+	if err != nil {
+		return nil, err
 	}
 
 	// Use server's CallTool which handles local, remote, and provider tools
 	response, err := s.CallTool(ctx, name, args)
 	if err == ErrUnknownTool {
-		return NewToolResponseText("Tool not found: " + name + ". Use tool_search to discover available tools."), nil
+		return NewToolResponseError("Tool not found: " + name + ". Use tool_search to discover available tools."), nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	return response, nil
+}
+
+// executeToolArguments reads execute_tool's arguments: the target's name and
+// its parameters. The parameters may be an object or a string holding a JSON
+// object (models often send that shape); "arguments" is accepted in place of
+// "parameters" for backward compatibility. Anything else is an error that
+// says what to send instead.
+func executeToolArguments(raw map[string]any) (string, map[string]any, error) {
+	var unknown []string
+	for k := range raw {
+		if k != "name" && k != "parameters" && k != "arguments" {
+			unknown = append(unknown, strconv.Quote(k))
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return "", nil, invalidArguments(fmt.Sprintf(`%s: unknown argument %s; pass the tool's name in "name" and its arguments in "parameters"`, ExecuteToolName, strings.Join(unknown, ", ")), unknown[0][1:len(unknown[0])-1])
+	}
+
+	name, _ := raw["name"].(string)
+	if name == "" {
+		return "", nil, invalidArguments(ExecuteToolName+`: "name" is required: the exact name of a tool found via tool_search`, "name")
+	}
+
+	key := "parameters"
+	value, hasParams := raw["parameters"]
+	if legacy, ok := raw["arguments"]; ok {
+		if hasParams {
+			return "", nil, invalidArguments(ExecuteToolName+`: pass the tool's arguments in "parameters" only, not also in "arguments"`, "arguments")
+		}
+		key, value = "arguments", legacy
+	}
+
+	switch v := value.(type) {
+	case nil:
+		return name, map[string]any{}, nil
+	case map[string]any:
+		return name, v, nil
+	case string:
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(v), &obj); err == nil && obj != nil {
+			return name, obj, nil
+		}
+	}
+	return "", nil, invalidArguments(fmt.Sprintf(`%s: %q must be a JSON object of the tool's arguments`, ExecuteToolName, key), key)
 }
 
 // getSessionManager returns the session manager under read lock
@@ -512,7 +563,8 @@ func (s *Server) toolsCallWireError(ctx context.Context, name string, err error)
 }
 
 // toolsCallResult turns a handler's outcome into the tools/call result the
-// spec defines, shared by the HTTP and stdio handlers. A *ToolError and an
+// spec defines, shared by the HTTP and stdio handlers. Arguments that fail
+// the tool's input schema are a tool execution error. A *ToolError and an
 // unknown tool stay protocol errors (wireErr); any other error the handler
 // returned is a tool execution error and is reported inside the result with
 // isError set, so the model sees the text and can self-correct. legacy
@@ -520,10 +572,16 @@ func (s *Server) toolsCallWireError(ctx context.Context, name string, err error)
 func (s *Server) toolsCallResult(ctx context.Context, name string, response *ToolResponse, err error, legacy bool) (result *ToolResult, wireErr *MCPError) {
 	if err != nil {
 		var toolErr *ToolError
-		if errors.As(err, &toolErr) || errors.Is(err, ErrUnknownTool) {
+		switch {
+		case errors.As(err, &toolErr) && toolErr.invalidArguments:
+			// Input validation is a tool execution error in the spec:
+			// the model reads the message and can retry.
+			response = NewToolResponseError(toolErr.Message)
+		case toolErr != nil || errors.Is(err, ErrUnknownTool):
 			return nil, s.toolsCallWireError(ctx, name, err)
+		default:
+			response = NewToolResponseError(err.Error())
 		}
-		response = NewToolResponseError(err.Error())
 	}
 	if response == nil {
 		response = &ToolResponse{}

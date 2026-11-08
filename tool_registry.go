@@ -364,9 +364,17 @@ func validateRequiredParameters(inputSchema any, args map[string]any) error {
 		} else if ok {
 			msg = "parameter " + se.path + " " + se.msg
 		}
-		return NewToolError(ErrorCodeInvalidParams, msg, map[string]any{"parameter": pathParameter(err)})
+		return invalidArguments(msg, pathParameter(err))
 	}
 	return nil
+}
+
+// invalidArguments is the error for a tool call whose arguments the tool
+// can't take: a *ToolError (-32602) to callers of Server.CallTool, which
+// tools/call reports as a tool execution error (isError), as the spec asks
+// of input validation errors, so the model can correct the call.
+func invalidArguments(msg, parameter string) error {
+	return &ToolError{Code: ErrorCodeInvalidParams, Message: msg, Data: map[string]any{"parameter": parameter}, invalidArguments: true}
 }
 
 // pathParameter is the top-level argument name a schema error refers to.

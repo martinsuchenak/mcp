@@ -46,6 +46,15 @@ reports it inside the result with `isError: true`, which is what the MCP tools
 spec asks for and what lets the model read the message and self-correct.
 `NewToolError` is for protocol-level failures only.
 
+## Argument Validation
+
+Arguments are checked against the tool's input schema before the handler
+runs. A missing required argument, a value of the wrong type or an unknown
+argument comes back as a tool execution error (`isError: true`) whose text
+names the problem — the MCP tools spec counts input validation errors as tool
+execution errors, so the model can correct the call. `Server.CallTool`
+callers get a `*mcp.ToolError` with code `-32602` for the same failures.
+
 ## Error Code Reference
 
 Standard JSON-RPC codes used by the library:

@@ -160,8 +160,11 @@ func TestAddSale_MissingRequiredParam(t *testing.T) {
 	defer server.Close()
 
 	result := post(t, server.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_sale","arguments":{"date":"2026-09-15","product":"Widget"}}}`)
-	if result["error"] == nil {
-		t.Fatal("expected an error when amount is missing")
+	// A missing argument is an input validation error: a tool execution
+	// error (isError) the model can read, answered before the tool runs.
+	res, _ := result["result"].(map[string]any)
+	if res == nil || res["isError"] != true {
+		t.Fatalf("expected an isError result when amount is missing, got %v", result)
 	}
 }
 
@@ -170,11 +173,11 @@ func TestAddSale_WrongParamType(t *testing.T) {
 	defer server.Close()
 
 	result := post(t, server.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_sale","arguments":{"date":"2026-09-15","product":"Widget","amount":"not-a-number"}}}`)
-	// A value of the wrong JSON type fails the tool's inputSchema: that is
-	// a malformed request, answered with -32602 before the tool runs.
-	errObj, _ := result["error"].(map[string]any)
-	if errObj == nil || errObj["code"] != float64(-32602) {
-		t.Fatalf("expected -32602 when amount is not a number, got %v", result)
+	// A value of the wrong JSON type fails the tool's inputSchema: an input
+	// validation error, reported with isError before the tool runs.
+	res, _ := result["result"].(map[string]any)
+	if res == nil || res["isError"] != true {
+		t.Fatalf("expected an isError result when amount is not a number, got %v", result)
 	}
 }
 

@@ -46,9 +46,10 @@ func TestHTTPNumericArgumentsReadAsNumbers(t *testing.T) {
 	if !strings.Contains(out, `"sum":5.5`) || !strings.Contains(out, `"n":42`) || strings.Contains(out, "isError") {
 		t.Fatalf("got %s", out)
 	}
-	// A wrong type is a malformed request.
+	// A wrong type is an input validation error: a tool execution error
+	// the model can read, not a protocol error.
 	out = post(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sum","arguments":{"a":"x","b":3,"n":1}}}`)
-	if !strings.Contains(out, `"code":-32602`) || !strings.Contains(out, "parameter a must be of type number") {
+	if !strings.Contains(out, `"isError":true`) || !strings.Contains(out, "parameter a must be of type number") || strings.Contains(out, `"error"`) {
 		t.Fatalf("got %s", out)
 	}
 }
